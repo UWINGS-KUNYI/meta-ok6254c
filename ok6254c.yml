@@ -1,0 +1,68 @@
+header:
+  version: 11
+
+build_system: oe
+
+distro: poky
+
+defaults:
+  repos:
+    patches:
+      repo: meta-ok6254c
+
+repos:
+  meta-ti:
+    url: git://git.yoctoproject.org/meta-ti
+    refspec: kirkstone
+    layers:
+      meta-ti-bsp:
+      meta-ti-extras:
+
+  meta-arm:
+    url: git://git.yoctoproject.org/meta-arm
+    refspec: kirkstone
+    layers:
+      meta-arm:
+      meta-arm-bsp:
+      meta-arm-toolchain:
+
+  poky:
+    url: git://git.yoctoproject.org/poky
+    refspec: kirkstone
+    layers:
+      meta:
+      meta-poky:
+      meta-yocto-bsp:
+
+  meta-openembedded:
+    url: https://git.openembedded.org/meta-openembedded
+    refspec: kirkstone
+    layers:
+      meta-oe:
+      meta-python:
+
+  meta-ok6254c:
+    layers:
+      meta-ok6254c:
+
+local_conf_header:
+  base: |
+    CONF_VERSION = "2"
+    PACKAGE_CLASSES = "package_ipk"
+    LICENSE_FLAGS_ACCEPTED += "armcompiler"
+    BB_NUMBER_THREADS ?= "8"
+    PARALLEL_MAKE ?= "-j8"
+  misc: |
+    # BB_SIGNATURE_HANDLER = "OEEquivHash"
+    # BB_HASHSERVE = "auto"
+    # BB_HASHSERVE_UPSTREAM = "hashserv.yocto.io:8687"
+    # SSTATE_MIRRORS ?= "file://.* https://sstate.yoctoproject.org/all/PATH;downloadfilename=PATH"
+  root_password: |
+    USERS += "root"
+  debug_feature: |
+    EXTRA_IMAGE_FEATURES = " debug-tweaks "
+
+machine: ok6254c
+
+target:
+  - core-image-minimal
