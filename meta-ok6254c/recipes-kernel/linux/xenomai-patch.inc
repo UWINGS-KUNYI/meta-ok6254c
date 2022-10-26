@@ -190,3 +190,6 @@ file://cobalt/0177-irqchip-gic-v3-its-platform-msi-irq_pipeline-adverti.patch \
 file://cobalt/0178-irqchip-gic-v3-mbi-irq_pipeline-advertise-immediate-.patch \
 file://cobalt/0179-irqchip-gic-v3-its-irq_pipeline-advertise-immediate-.patch \
 "
+XENOMAI_KERNEL_PATCH=" \
+file://cobalt/0001-ti-linux-5.10.140-xenomai-3.2.1.patch \
+"

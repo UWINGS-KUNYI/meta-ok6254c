@@ -37,6 +37,7 @@ KERNEL_GIT_PROTOCOL = "https"
 SRC_URI += "${KERNEL_GIT_URI};protocol=${KERNEL_GIT_PROTOCOL};branch=${BRANCH} \
 	    file://defconfig \
 	    ${XENOMAI_DOVETAIL} \
+	    ${XENOMAI_KERNEL_PATCH} \
 	   "
 
 FILES:${KERNEL_PACKAGE_NAME}-devicetree += "/${KERNEL_IMAGEDEST}/*.itb"
