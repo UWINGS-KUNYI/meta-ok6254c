@@ -1,0 +1,38 @@
+From 0d8178c610182c6437745c211df721651bf665da Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sat, 13 Mar 2021 12:45:02 +0100
+Subject: [PATCH 096/179] arm64: dovetail: remove stale user_exit() in syscall
+ entry
+
+user_exit() is now redundant when called from el0_svc_common.
+
+At this chance, assume that we must be unstalled on entry if running
+inband, otherwise the virtual interrupt state is broken. Add the
+proper runtime assertion to check this.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm64/kernel/syscall.c | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/kernel/syscall.c b/arch/arm64/kernel/syscall.c
+index 78db39f10..24ab7372d 100644
+--- a/arch/arm64/kernel/syscall.c
++++ b/arch/arm64/kernel/syscall.c
+@@ -119,11 +119,9 @@ static void el0_svc_common(struct pt_regs *regs, int scno, int sc_nr,
+ 	 */
+ 
+ 	cortex_a76_erratum_1463225_svc_handler();
++	WARN_ON_ONCE(dovetail_debug() &&
++		     running_inband() && test_inband_stall());
+ 	local_daif_restore(DAIF_PROCCTX);
+-	if (running_inband()) {
+-		unstall_inband();
+-		user_exit();
+-	}
+ 
+ 	ret = pipeline_syscall(scno, regs);
+ 	if (ret > 0)
+-- 
+2.38.1
+

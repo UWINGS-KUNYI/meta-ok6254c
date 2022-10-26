@@ -1,0 +1,36 @@
+From c00ca8b95d86f10351ddcf686a43d7c23855b37c Mon Sep 17 00:00:00 2001
+From: Jan Kiszka <jan.kiszka@siemens.com>
+Date: Mon, 7 Jun 2021 12:05:33 +0200
+Subject: [PATCH 109/179] x86: dovetail: Fix TS flag reservation
+
+We had an overlap with compat flags so that, e.g., TS_COMPAT_RESTART
+made a 32-bit standard task also a dovetail one.
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+---
+ arch/x86/include/asm/thread_info.h | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/include/asm/thread_info.h b/arch/x86/include/asm/thread_info.h
+index 297850556..8b61e2411 100644
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -232,10 +232,11 @@ static inline int arch_within_stack_frames(const void * const stack,
+  * have to worry about atomic accesses.
+  */
+ #define TS_COMPAT		0x0002	/* 32bit syscall active (64BIT)*/
+-#define TS_OOB			0x0004	/* Thread is running out-of-band */
+-#define TS_DOVETAIL		0x0008  /* Dovetail notifier enabled */
+-#define TS_OFFSTAGE		0x0010	/* Thread is in-flight to OOB context */
+-#define TS_OOBTRAP		0x0020	/* Handling a trap from OOB context */
++/* bits 2 and 3 reserved for compat */
++#define TS_OOB			0x0010	/* Thread is running out-of-band */
++#define TS_DOVETAIL		0x0020  /* Dovetail notifier enabled */
++#define TS_OFFSTAGE		0x0040	/* Thread is in-flight to OOB context */
++#define TS_OOBTRAP		0x0080	/* Handling a trap from OOB context */
+ 
+ #define _TLF_OOB		TS_OOB
+ #define _TLF_DOVETAIL		TS_DOVETAIL
+-- 
+2.38.1
+

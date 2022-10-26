@@ -1,0 +1,26 @@
+From 96be9e0e49eead84d1f35cd1a5a68b86f18f1cc9 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 9 Jun 2022 13:55:08 +0200
+Subject: [PATCH 166/179] arm64: dovetail: fix COMPAT syscall detection helper
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm64/include/asm/dovetail.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/include/asm/dovetail.h b/arch/arm64/include/asm/dovetail.h
+index 83b7f39b2..24756fe85 100644
+--- a/arch/arm64/include/asm/dovetail.h
++++ b/arch/arm64/include/asm/dovetail.h
+@@ -38,7 +38,7 @@ static inline void arch_dovetail_switch_finish(bool enter_inband)
+  * honor the ABI stability promise anyway.
+  */
+ #define arch_dovetail_is_syscall(__nr)	\
+-	((is_compat_task() && (__nr) == 172) || __nr == __NR_prctl)
++	(is_compat_task() ? (__nr) == 172 : (__nr) == __NR_prctl)
+ 
+ #endif
+ 
+-- 
+2.38.1
+

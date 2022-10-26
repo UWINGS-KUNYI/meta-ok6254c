@@ -1,0 +1,33 @@
+From 10d92684ef608b9f7e807f9342766974eb3531b4 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Wed, 4 Aug 2021 17:48:15 +0200
+Subject: [PATCH 132/179] dovetail: detect context switch from the pipeline
+ entry
+
+We may not do out-of-band context switch from a pipeline entry. The
+companion core has to wait until irq_exit_pipeline() notifies it about
+leaving the pipeline, at which point rescheduling is legit.
+
+Add a debug assertion (CONFIG_DEBUG_DOVETAIL) to catch invalid calls.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ kernel/sched/core.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 046302a3b..7588d8b09 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -8609,6 +8609,8 @@ bool dovetail_context_switch(struct dovetail_altsched_context *out,
+ 	struct mm_struct *prev_mm, *next_mm;
+ 	bool inband_tail = false;
+ 
++	WARN_ON_ONCE(dovetail_debug() && on_pipeline_entry());
++
+ 	if (leave_inband) {
+ 		struct task_struct *tsk = current;
+ 		/*
+-- 
+2.38.1
+

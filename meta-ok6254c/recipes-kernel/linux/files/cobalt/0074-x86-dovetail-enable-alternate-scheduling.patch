@@ -1,0 +1,254 @@
+From b78c575c12480dc700cbfa7e039980995d767bf7 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Mon, 6 May 2019 17:09:23 +0200
+Subject: [PATCH 074/179] x86: dovetail: enable alternate scheduling
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/x86/include/asm/dovetail.h | 15 +++++++++++++
+ arch/x86/kernel/process_64.c    | 11 ++++++----
+ arch/x86/mm/fault.c             | 38 +++++++++++++++++++++++++++++++++
+ arch/x86/mm/tlb.c               | 34 ++++++++++++++++++++++-------
+ 4 files changed, 86 insertions(+), 12 deletions(-)
+
+diff --git a/arch/x86/include/asm/dovetail.h b/arch/x86/include/asm/dovetail.h
+index ee9cc35e6..74b1e5c12 100644
+--- a/arch/x86/include/asm/dovetail.h
++++ b/arch/x86/include/asm/dovetail.h
+@@ -6,4 +6,19 @@
+ #ifndef _ASM_X86_DOVETAIL_H
+ #define _ASM_X86_DOVETAIL_H
+ 
++#if !defined(__ASSEMBLY__) && defined(CONFIG_DOVETAIL)
++
++static inline void arch_dovetail_exec_prepare(void)
++{ }
++
++static inline
++void arch_dovetail_switch_prepare(bool leave_inband)
++{ }
++
++static inline
++void arch_dovetail_switch_finish(bool enter_inband)
++{ }
++
++#endif
++
+ #endif /* _ASM_X86_DOVETAIL_H */
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index 9bf32d710..1cb8c35f5 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -540,6 +540,8 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 	WARN_ON_ONCE(IS_ENABLED(CONFIG_DEBUG_ENTRY) &&
+ 		     this_cpu_read(irq_count) != -1);
+ 
++	WARN_ON_ONCE(dovetail_debug() && !hard_irqs_disabled());
++
+ 	if (!test_thread_flag(TIF_NEED_FPU_LOAD))
+ 		switch_fpu_prepare(prev_p, cpu);
+ 
+@@ -719,6 +721,7 @@ static long prctl_map_vdso(const struct vdso_image *image, unsigned long addr)
+ 
+ long do_arch_prctl_64(struct task_struct *task, int option, unsigned long arg2)
+ {
++	unsigned long flags;
+ 	int ret = 0;
+ 
+ 	switch (option) {
+@@ -726,7 +729,7 @@ long do_arch_prctl_64(struct task_struct *task, int option, unsigned long arg2)
+ 		if (unlikely(arg2 >= TASK_SIZE_MAX))
+ 			return -EPERM;
+ 
+-		preempt_disable();
++		flags = hard_preempt_disable();
+ 		/*
+ 		 * ARCH_SET_GS has always overwritten the index
+ 		 * and the base. Zero is the most sensible value
+@@ -747,7 +750,7 @@ long do_arch_prctl_64(struct task_struct *task, int option, unsigned long arg2)
+ 			task->thread.gsindex = 0;
+ 			x86_gsbase_write_task(task, arg2);
+ 		}
+-		preempt_enable();
++		hard_preempt_enable(flags);
+ 		break;
+ 	}
+ 	case ARCH_SET_FS: {
+@@ -758,7 +761,7 @@ long do_arch_prctl_64(struct task_struct *task, int option, unsigned long arg2)
+ 		if (unlikely(arg2 >= TASK_SIZE_MAX))
+ 			return -EPERM;
+ 
+-		preempt_disable();
++		flags = hard_preempt_disable();
+ 		/*
+ 		 * Set the selector to 0 for the same reason
+ 		 * as %gs above.
+@@ -776,7 +779,7 @@ long do_arch_prctl_64(struct task_struct *task, int option, unsigned long arg2)
+ 			task->thread.fsindex = 0;
+ 			x86_fsbase_write_task(task, arg2);
+ 		}
+-		preempt_enable();
++		hard_preempt_enable(flags);
+ 		break;
+ 	}
+ 	case ARCH_GET_FS: {
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 5da1ff0b6..56e606be9 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -1494,3 +1494,41 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
+ 
+ 	irqentry_exit(regs, state);
+ }
++
++#ifdef CONFIG_DOVETAIL
++
++void arch_advertise_page_mapping(unsigned long start, unsigned long end)
++{
++	unsigned long next, addr = start;
++	pgd_t *pgd, *pgd_ref;
++	struct page *page;
++
++	/*
++	 * APEI may create temporary mappings in interrupt context -
++	 * nothing we can and need to propagate globally.
++	 */
++	if (in_interrupt())
++		return;
++
++	if (!(start >= VMALLOC_START && start < VMALLOC_END))
++		return;
++
++	do {
++		next = pgd_addr_end(addr, end);
++		pgd_ref = pgd_offset_k(addr);
++		if (pgd_none(*pgd_ref))
++			continue;
++		spin_lock(&pgd_lock);
++		list_for_each_entry(page, &pgd_list, lru) {
++			pgd = page_address(page) + pgd_index(addr);
++			if (pgd_none(*pgd))
++				set_pgd(pgd, *pgd_ref);
++		}
++		spin_unlock(&pgd_lock);
++		addr = next;
++	} while (addr != end);
++
++	arch_flush_lazy_mmu_mode();
++}
++
++#endif
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 2b3dfc89d..b720da2bc 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -443,7 +443,9 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
+ 	 */
+ 
+ 	/* We don't want flush_tlb_func_* to run concurrently with us. */
+-	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
++	if (IS_ENABLED(CONFIG_DOVETAIL))
++		WARN_ON_ONCE(!hard_irqs_disabled());
++	else if (IS_ENABLED(CONFIG_PROVE_LOCKING))
+ 		WARN_ON_ONCE(!irqs_disabled());
+ 
+ 	/*
+@@ -669,16 +671,24 @@ static void flush_tlb_func_common(const struct flush_tlb_info *f,
+ 	 *                   wants us to catch up to.
+ 	 */
+ 	struct mm_struct *loaded_mm = this_cpu_read(cpu_tlbstate.loaded_mm);
+-	u32 loaded_mm_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+-	u64 mm_tlb_gen = atomic64_read(&loaded_mm->context.tlb_gen);
+-	u64 local_tlb_gen = this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen);
++	u32 loaded_mm_asid;
++	u64 mm_tlb_gen;
++	u64 local_tlb_gen;
+ 	unsigned long flags;
+ 
+ 	/* This code cannot presently handle being reentered. */
+ 	VM_WARN_ON(!irqs_disabled());
+ 
+-	if (unlikely(loaded_mm == &init_mm))
++	protect_inband_mm(flags);
++
++	loaded_mm_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
++	mm_tlb_gen = atomic64_read(&loaded_mm->context.tlb_gen);
++	local_tlb_gen = this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen);
++
++	if (unlikely(loaded_mm == &init_mm)) {
++		unprotect_inband_mm(flags);
+ 		return;
++	}
+ 
+ 	VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].ctx_id) !=
+ 		   loaded_mm->context.ctx_id);
+@@ -693,7 +703,6 @@ static void flush_tlb_func_common(const struct flush_tlb_info *f,
+ 		 * This should be rare, with native_flush_tlb_others skipping
+ 		 * IPIs to lazy TLB mode CPUs.
+ 		 */
+-		protect_inband_mm(flags);
+ 		switch_mm_irqs_off(NULL, &init_mm, NULL);
+ 		unprotect_inband_mm(flags);
+ 		return;
+@@ -706,6 +715,7 @@ static void flush_tlb_func_common(const struct flush_tlb_info *f,
+ 		 * be handled can catch us all the way up, leaving no work for
+ 		 * the second flush.
+ 		 */
++		unprotect_inband_mm(flags);
+ 		trace_tlb_flush(reason, 0);
+ 		return;
+ 	}
+@@ -713,6 +723,8 @@ static void flush_tlb_func_common(const struct flush_tlb_info *f,
+ 	WARN_ON_ONCE(local_tlb_gen > mm_tlb_gen);
+ 	WARN_ON_ONCE(f->new_tlb_gen > mm_tlb_gen);
+ 
++	unprotect_inband_mm(flags);
++
+ 	/*
+ 	 * If we get to this point, we know that our TLB is out of date.
+ 	 * This does not strictly imply that we need to flush (it's
+@@ -1069,7 +1081,7 @@ STATIC_NOPV void native_flush_tlb_global(void)
+ 	 * from interrupts. (Use the raw variant because this code can
+ 	 * be called from deep inside debugging code.)
+ 	 */
+-	raw_local_irq_save(flags);
++	flags = hard_local_irq_save();
+ 
+ 	cr4 = this_cpu_read(cpu_tlbstate.cr4);
+ 	/* toggle PGE */
+@@ -1077,7 +1089,7 @@ STATIC_NOPV void native_flush_tlb_global(void)
+ 	/* write old PGE again and flush TLBs */
+ 	native_write_cr4(cr4);
+ 
+-	raw_local_irq_restore(flags);
++	hard_local_irq_restore(flags);
+ }
+ 
+ /*
+@@ -1085,6 +1097,8 @@ STATIC_NOPV void native_flush_tlb_global(void)
+  */
+ STATIC_NOPV void native_flush_tlb_local(void)
+ {
++	unsigned long flags;
++
+ 	/*
+ 	 * Preemption or interrupts must be disabled to protect the access
+ 	 * to the per CPU variable and to prevent being preempted between
+@@ -1092,10 +1106,14 @@ STATIC_NOPV void native_flush_tlb_local(void)
+ 	 */
+ 	WARN_ON_ONCE(preemptible());
+ 
++	flags = hard_cond_local_irq_save();
++
+ 	invalidate_user_asid(this_cpu_read(cpu_tlbstate.loaded_mm_asid));
+ 
+ 	/* If current->mm == NULL then the read_cr3() "borrows" an mm */
+ 	native_write_cr3(__native_read_cr3());
++
++	hard_cond_local_irq_restore(flags);
+ }
+ 
+ void flush_tlb_local(void)
+-- 
+2.38.1
+

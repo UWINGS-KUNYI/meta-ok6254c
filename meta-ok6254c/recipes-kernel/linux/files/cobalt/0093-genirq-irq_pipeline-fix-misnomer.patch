@@ -1,0 +1,62 @@
+From 0fbd4ce1e711202ebe3e60784ddb63a3998b8ae4 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 7 Feb 2021 15:42:41 +0100
+Subject: [PATCH 093/179] genirq: irq_pipeline: fix misnomer
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ kernel/irq/pipeline.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/irq/pipeline.c b/kernel/irq/pipeline.c
+index 6937a04b3..4e3003612 100644
+--- a/kernel/irq/pipeline.c
++++ b/kernel/irq/pipeline.c
+@@ -144,7 +144,7 @@ static inline u32 hash_irq(unsigned int irq)
+ }
+ 
+ static __always_inline
+-struct irq_desc *cached_irq_to_desc(unsigned int irq)
++struct irq_desc *irq_to_cached_desc(unsigned int irq)
+ {
+ 	int hval = hash_irq(irq);
+ 	struct irq_desc *desc = desc_cache[hval];
+@@ -166,7 +166,7 @@ void uncache_irq_desc(unsigned int irq)
+ 
+ #else
+ 
+-static struct irq_desc *cached_irq_to_desc(unsigned int irq)
++static struct irq_desc *irq_to_cached_desc(unsigned int irq)
+ {
+ 	return irq_to_desc(irq);
+ }
+@@ -1080,7 +1080,7 @@ int generic_pipeline_irq(unsigned int irq, struct pt_regs *regs)
+ 	trace_irq_pipeline_entry(irq);
+ 
+ 	old_regs = set_irq_regs(regs);
+-	desc = cached_irq_to_desc(irq);
++	desc = irq_to_cached_desc(irq);
+ 
+ 	if (irq_pipeline_debug()) {
+ 		if (!hard_irqs_disabled()) {
+@@ -1190,7 +1190,7 @@ int irq_inject_pipeline(unsigned int irq)
+ 	struct irq_desc *desc;
+ 	unsigned long flags;
+ 
+-	desc = cached_irq_to_desc(irq);
++	desc = irq_to_cached_desc(irq);
+ 	if (desc == NULL)
+ 		return -EINVAL;
+ 
+@@ -1267,7 +1267,7 @@ void sync_current_irq_stage(void) /* hard irqs off */
+ 		 */
+ 		barrier();
+ 
+-		desc = cached_irq_to_desc(irq);
++		desc = irq_to_cached_desc(irq);
+ 
+ 		if (stage == &inband_stage) {
+ 			hard_local_irq_enable();
+-- 
+2.38.1
+

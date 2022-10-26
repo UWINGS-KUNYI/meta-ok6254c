@@ -1,0 +1,28 @@
+From 732e576b3fbebb8f873cd9cdddb6d44ba2877402 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sat, 28 Aug 2021 12:31:29 +0200
+Subject: [PATCH 137/179] perf beauty: dovetail: declare oob socket class
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ tools/perf/trace/beauty/include/linux/socket.h | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/tools/perf/trace/beauty/include/linux/socket.h b/tools/perf/trace/beauty/include/linux/socket.h
+index 9aa530d49..93b104ee2 100644
+--- a/tools/perf/trace/beauty/include/linux/socket.h
++++ b/tools/perf/trace/beauty/include/linux/socket.h
+@@ -223,8 +223,9 @@ struct ucred {
+ 				 * reuses AF_INET address family
+ 				 */
+ #define AF_XDP		44	/* XDP sockets			*/
++#define AF_OOB		45	/* Out-of-band domain sockets */
+ 
+-#define AF_MAX		45	/* For now.. */
++#define AF_MAX		46	/* For now.. */
+ 
+ /* Protocol families, same as address families. */
+ #define PF_UNSPEC	AF_UNSPEC
+-- 
+2.38.1
+

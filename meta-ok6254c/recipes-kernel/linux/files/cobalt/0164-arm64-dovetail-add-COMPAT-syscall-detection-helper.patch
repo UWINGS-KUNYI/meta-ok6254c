@@ -1,0 +1,32 @@
+From f7f09751b91d04d3cd30eaca0b64905a21651270 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 9 Jun 2022 09:41:07 +0200
+Subject: [PATCH 164/179] arm64: dovetail: add COMPAT syscall detection helper
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm64/include/asm/dovetail.h | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/arch/arm64/include/asm/dovetail.h b/arch/arm64/include/asm/dovetail.h
+index 668679399..83b7f39b2 100644
+--- a/arch/arm64/include/asm/dovetail.h
++++ b/arch/arm64/include/asm/dovetail.h
+@@ -32,6 +32,14 @@ static inline void arch_dovetail_switch_finish(bool enter_inband)
+ 	fpsimd_restore_current_oob();
+ }
+ 
++/*
++ * 172 is __NR_prctl from unistd32 in ARM32 mode, without #inclusion
++ * hell. At the end of the day, this number is written in stone to
++ * honor the ABI stability promise anyway.
++ */
++#define arch_dovetail_is_syscall(__nr)	\
++	((is_compat_task() && (__nr) == 172) || __nr == __NR_prctl)
++
+ #endif
+ 
+ #endif /* _ASM_ARM64_DOVETAIL_H */
+-- 
+2.38.1
+

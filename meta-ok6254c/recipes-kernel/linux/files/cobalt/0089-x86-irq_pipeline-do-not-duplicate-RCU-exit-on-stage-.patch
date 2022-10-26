@@ -1,0 +1,86 @@
+From a60d34ab8441e6bb0b8f003b4505291c1275021a Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 26 Jan 2021 17:20:31 +0100
+Subject: [PATCH 089/179] x86: irq_pipeline: do not duplicate RCU exit on stage
+ switch
+
+There is no point in manually exiting RCU upon unwinding a task
+context through a stage transition from out-of-band to in-band. This
+would wreck the RCU state machine badly, duplicating the notification
+about kernel exit.
+
+For sure, that task did originally move out-of-band on some kernel
+entry (e.g. a syscall), and will therefore notify RCU about leaving
+the kernel on its way back to userland.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/x86/kernel/irq_pipeline.c | 47 +---------------------------------
+ 1 file changed, 1 insertion(+), 46 deletions(-)
+
+diff --git a/arch/x86/kernel/irq_pipeline.c b/arch/x86/kernel/irq_pipeline.c
+index 22f1df4ef..d8cb70118 100644
+--- a/arch/x86/kernel/irq_pipeline.c
++++ b/arch/x86/kernel/irq_pipeline.c
+@@ -235,57 +235,12 @@ void arch_handle_irq(struct pt_regs *regs, u8 vector, bool irq_movable)
+ 	generic_pipeline_irq(irq, regs);
+ }
+ 
+-static irqentry_state_t
+-kernel_exit_check_downgrade(struct pt_regs *regs)
+-{
+-	irqentry_state_t ret = {
+-		.exit_rcu = false,
+-		.stage_info = 0,
+-	};
+-
+-	if (running_oob())
+-		return ret;
+-
+-	/*
+-	 * The interrupt preempted some task running out-of-band, but
+-	 * the latter switched back in-band before returning to
+-	 * us. RCU should be watching, so we need to exit the kernel
+-	 * in an orderly fashion, unwinding the original in-band
+-	 * context before it moved out-of-band.
+-	 */
+-	if (irq_pipeline_debug()) {
+-		WARN_ON_ONCE(!rcu_is_watching());
+-		WARN_ON_ONCE(irqs_disabled());
+-	}
+-
+-	local_irq_disable();
+-
+-	ret.exit_rcu = true;
+-	ret.stage_info = IRQENTRY_INBAND_STALLED;
+-
+-	return ret;
+-}
+-
+ noinstr void arch_pipeline_entry(struct pt_regs *regs, u8 vector)
+ {
+ 	struct irq_stage_data *prevd;
+ 	irqentry_state_t state;
+ 
+-	if (running_oob()) {
+-		instrumentation_begin();
+-		prevd = handle_irq_pipelined_prepare(regs);
+-		arch_handle_irq(regs, vector, false);
+-		handle_irq_pipelined_finish(prevd, regs);
+-		state = kernel_exit_check_downgrade(regs);
+-		instrumentation_end();
+-		if (state.exit_rcu) {
+-			irqentry_exit(regs, state);
+-			WARN_ON_ONCE(irq_pipeline_debug() && need_resched());
+-		}
+-		return;
+-	}
+-
+-	if (unlikely(irqs_disabled())) {
++	if (unlikely(running_oob() || irqs_disabled())) {
+ 		instrumentation_begin();
+ 		prevd = handle_irq_pipelined_prepare(regs);
+ 		arch_handle_irq(regs, vector, false);
+-- 
+2.38.1
+

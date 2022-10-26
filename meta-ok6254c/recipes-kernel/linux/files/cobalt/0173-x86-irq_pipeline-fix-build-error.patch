@@ -1,0 +1,26 @@
+From 958e413038f5f52856cc95edc35f61764770e8ed Mon Sep 17 00:00:00 2001
+From: Jan Kiszka <jan.kiszka@siemens.com>
+Date: Fri, 5 Aug 2022 10:04:39 +0200
+Subject: [PATCH 173/179] x86: irq_pipeline: fix build error
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+---
+ arch/x86/kernel/alternative.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index a1e7ba5e0..c08c2e21c 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -369,7 +369,7 @@ static __always_inline int optimize_nops_range(u8 *instr, u8 instrlen, int off)
+ 
+ 	flags = hard_local_irq_save();
+ 	add_nops(instr + off, nnops);
+-	hard_local_irq_restore();
++	hard_local_irq_restore(flags);
+ 
+ 	DUMP_BYTES(instr, instrlen, "%px: [%d:%d) optimized NOPs: ", instr, off, i);
+ 
+-- 
+2.38.1
+

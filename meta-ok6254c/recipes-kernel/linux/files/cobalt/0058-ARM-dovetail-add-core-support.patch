@@ -1,0 +1,97 @@
+From 3cfd7db63a28b4d1ac5c25cfb13526d56036dbcb Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 12 May 2020 17:55:05 +0200
+Subject: [PATCH 058/179] ARM: dovetail: add core support
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm/Kconfig                   | 3 +++
+ arch/arm/include/asm/dovetail.h    | 9 +++++++++
+ arch/arm/include/asm/thread_info.h | 6 ++++++
+ 3 files changed, 18 insertions(+)
+ create mode 100644 arch/arm/include/asm/dovetail.h
+
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index 45b48913d..24e6f70af 100644
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -585,6 +585,7 @@ config ARCH_MULTI_V6_V7
+ 	bool
+ 	select MIGHT_HAVE_CACHE_L2X0
+ 	select HAVE_IRQ_PIPELINE
++	select HAVE_DOVETAIL if CPU_HAS_ASID
+ 
+ config ARCH_MULTI_CPU_AUTO
+ 	def_bool !(ARCH_MULTI_V4 || ARCH_MULTI_V4T || ARCH_MULTI_V6_V7)
+@@ -1237,6 +1238,8 @@ config SCHED_SMT
+ 	  MultiThreading at a cost of slightly increased overhead in some
+ 	  places. If unsure say N here.
+ 
++source "kernel/Kconfig.dovetail"
++
+ config HAVE_ARM_SCU
+ 	bool
+ 	help
+diff --git a/arch/arm/include/asm/dovetail.h b/arch/arm/include/asm/dovetail.h
+new file mode 100644
+index 000000000..86e81cce9
+--- /dev/null
++++ b/arch/arm/include/asm/dovetail.h
+@@ -0,0 +1,9 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright (C) 2016 Philippe Gerum.
++ */
++#ifndef _ASM_ARM_DOVETAIL_H
++#define _ASM_ARM_DOVETAIL_H
++
++#endif /* _ASM_ARM_DOVETAIL_H */
+diff --git a/arch/arm/include/asm/thread_info.h b/arch/arm/include/asm/thread_info.h
+index acae8091d..8c5377303 100644
+--- a/arch/arm/include/asm/thread_info.h
++++ b/arch/arm/include/asm/thread_info.h
+@@ -21,6 +21,7 @@
+ 
+ struct task_struct;
+ 
++#include <dovetail/thread_info.h>
+ #include <asm/types.h>
+ 
+ typedef unsigned long mm_segment_t;
+@@ -66,6 +67,7 @@ struct thread_info {
+ #ifdef CONFIG_ARM_THUMBEE
+ 	unsigned long		thumbee_state;	/* ThumbEE Handler Base register */
+ #endif
++	struct oob_thread_state	oob_state; /* co-kernel thread state */
+ };
+ 
+ #define INIT_THREAD_INFO(tsk)						\
+@@ -143,6 +145,7 @@ extern int vfp_restore_user_hwstate(struct user_vfp *,
+ #define TIF_USING_IWMMXT	17
+ #define TIF_MEMDIE		18	/* is terminating due to OOM killer */
+ #define TIF_RESTORE_SIGMASK	20
++#define TIF_MAYDAY		21	/* emergency trap pending */
+ 
+ #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+@@ -153,6 +156,7 @@ extern int vfp_restore_user_hwstate(struct user_vfp *,
+ #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+ #define _TIF_USING_IWMMXT	(1 << TIF_USING_IWMMXT)
++#define _TIF_MAYDAY		(1 << TIF_MAYDAY)
+ 
+ /* Checks for any syscall work in entry-common.S */
+ #define _TIF_SYSCALL_WORK (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | \
+@@ -168,6 +172,8 @@ extern int vfp_restore_user_hwstate(struct user_vfp *,
+  * Local (synchronous) thread flags.
+  */
+ #define _TLF_OOB		0x0001
++#define _TLF_DOVETAIL		0x0002
++#define _TLF_OFFSTAGE		0x0004
+ 
+ #endif /* __KERNEL__ */
+ #endif /* __ASM_ARM_THREAD_INFO_H */
+-- 
+2.38.1
+

@@ -1,0 +1,47 @@
+From c7504d700e3828ac7d0b2a3cfcc9dd092323641e Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Fri, 22 Jul 2022 15:45:31 +0200
+Subject: [PATCH 169/179] net: dovetail: move oob flags out of skb header
+
+The 'oob' bits should not be part of the header because we do not want
+them to be copied from the source skb during a clone operation. Manage
+these bits outside of the skb header section, making sure to (re)set
+them appropriately when required.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ include/linux/skbuff.h | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index ba230f204..4c9afe3e2 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -788,6 +788,12 @@ struct sk_buff {
+ #ifdef CONFIG_SKB_EXTENSIONS
+ 	__u8			active_extensions;
+ #endif
++#ifdef CONFIG_NET_OOB
++	__u8			oob:1;
++	__u8			oob_clone:1;
++	__u8			oob_cloned:1;
++#endif
++
+ 	/* fields enclosed in headers_start/headers_end are copied
+ 	 * using a single memcpy() in __copy_skb_header()
+ 	 */
+@@ -858,11 +864,6 @@ struct sk_buff {
+ #ifdef CONFIG_TLS_DEVICE
+ 	__u8			decrypted:1;
+ #endif
+-#ifdef CONFIG_NET_OOB
+-	__u8			oob:1;
+-	__u8			oob_clone:1;
+-	__u8			oob_cloned:1;
+-#endif
+ 
+ #ifdef CONFIG_NET_SCHED
+ 	__u16			tc_index;	/* traffic control index */
+-- 
+2.38.1
+

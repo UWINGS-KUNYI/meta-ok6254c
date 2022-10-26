@@ -1,0 +1,79 @@
+From bef2008f03396df7fd5224dd5d98b8645bab1b6d Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 13 Jun 2021 08:53:33 +0200
+Subject: [PATCH 114/179] lockdep: irq_pipeline: fix ambiguous naming
+
+lockdep_save/restore_irqs_state might convey the wrong information:
+this is not about saving+disabling then conditionally re-enabling the
+tracked state, but merely to read/write such state
+unconditionally. Let's change this to non-equivocal names.
+---
+ include/linux/lockdep.h | 12 +++++-------
+ kernel/sched/core.c     |  6 +++---
+ 2 files changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/lockdep.h b/include/linux/lockdep.h
+index 80db2089f..fcdf40b55 100644
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@ -591,12 +591,10 @@ do {									\
+ 		(running_oob() || this_cpu_read(hardirqs_enabled)));	\
+ } while (0)
+ 
+-#define lockdep_save_irqs_state(__state)				\
+-do {									\
+-	(__state) = this_cpu_read(hardirqs_enabled);			\
+-} while (0)
++#define lockdep_read_irqs_state()					\
++	({ this_cpu_read(hardirqs_enabled); })
+ 
+-#define lockdep_restore_irqs_state(__state)				\
++#define lockdep_write_irqs_state(__state)				\
+ do {									\
+ 	this_cpu_write(hardirqs_enabled, __state);			\
+ } while (0)
+@@ -629,8 +627,8 @@ do {									\
+ 
+ # define lockdep_assert_irqs_enabled() do { } while (0)
+ # define lockdep_assert_irqs_disabled() do { } while (0)
+-# define lockdep_save_irqs_state(__state) do { (void)(__state); } while (0)
+-# define lockdep_restore_irqs_state(__state) do { (void)(__state); } while (0)
++# define lockdep_read_irqs_state() 0
++# define lockdep_write_irqs_state(__state) do { (void)(__state); } while (0)
+ # define lockdep_assert_in_irq() do { } while (0)
+ 
+ # define lockdep_assert_preemption_enabled() do { } while (0)
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 2bf9020ce..046302a3b 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -8685,7 +8685,7 @@ bool dovetail_context_switch(struct dovetail_altsched_context *out,
+ 	 * state maintained by lockdep must be preserved across
+ 	 * switches.
+ 	 */
+-	lockdep_save_irqs_state(lockdep_irqs);
++	lockdep_irqs = lockdep_read_irqs_state();
+ 
+ 	switch_to(prev, next, last);
+ 	barrier();
+@@ -8710,7 +8710,7 @@ bool dovetail_context_switch(struct dovetail_altsched_context *out,
+ 		else
+ 			preempt_count_sub(STAGE_OFFSET);
+ 
+-		lockdep_restore_irqs_state(lockdep_irqs);
++		lockdep_write_irqs_state(lockdep_irqs);
+ 
+ 		/*
+ 		 * Fixup the interrupt state conversely to what
+@@ -8724,7 +8724,7 @@ bool dovetail_context_switch(struct dovetail_altsched_context *out,
+ 		if (IS_ENABLED(CONFIG_HAVE_PERCPU_PREEMPT_COUNT))
+ 			preempt_count_set(pc);
+ 
+-		lockdep_restore_irqs_state(lockdep_irqs);
++		lockdep_write_irqs_state(lockdep_irqs);
+ 	}
+ 
+ 	arch_dovetail_switch_finish(leave_inband);
+-- 
+2.38.1
+

@@ -1,0 +1,31 @@
+From d614a372d85351d2ef3034f0275b3593c91bfbe8 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 22 Jul 2021 09:36:43 +0200
+Subject: [PATCH 123/179] pinctrl: samsung: irq_pipeline: enable out-of-band
+ interrupt handling
+
+We must decode the chained interrupts on the out-of-band stage to
+enable end-to-end out-of-band delivery. Set IRQF_OOB for the parent
+handler.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/pinctrl/samsung/pinctrl-exynos.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/pinctrl/samsung/pinctrl-exynos.c b/drivers/pinctrl/samsung/pinctrl-exynos.c
+index e1c86adb8..7da7f80e6 100644
+--- a/drivers/pinctrl/samsung/pinctrl-exynos.c
++++ b/drivers/pinctrl/samsung/pinctrl-exynos.c
+@@ -288,7 +288,7 @@ __init int exynos_eint_gpio_init(struct samsung_pinctrl_drv_data *d)
+ 	}
+ 
+ 	ret = devm_request_irq(dev, d->irq, exynos_eint_gpio_irq,
+-					0, dev_name(dev), d);
++					IRQF_OOB, dev_name(dev), d);
+ 	if (ret) {
+ 		dev_err(dev, "irq request failed\n");
+ 		return -ENXIO;
+-- 
+2.38.1
+

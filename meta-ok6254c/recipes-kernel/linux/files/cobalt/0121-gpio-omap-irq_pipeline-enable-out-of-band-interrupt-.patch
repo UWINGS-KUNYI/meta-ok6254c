@@ -1,0 +1,31 @@
+From 9c5324e4ed279fd49279be6f2e1a18aef5262234 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 22 Jul 2021 09:35:09 +0200
+Subject: [PATCH 121/179] gpio: omap: irq_pipeline: enable out-of-band
+ interrupt handling
+
+We must decode the chained interrupts on the out-of-band stage to
+enable end-to-end out-of-band delivery. Set IRQF_OOB for the parent
+handler.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/gpio/gpio-omap.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpio/gpio-omap.c b/drivers/gpio/gpio-omap.c
+index 08a08f6d2..3316893de 100644
+--- a/drivers/gpio/gpio-omap.c
++++ b/drivers/gpio/gpio-omap.c
+@@ -1058,7 +1058,7 @@ static int omap_gpio_chip_init(struct gpio_bank *bank, struct irq_chip *irqc)
+ 
+ 	ret = devm_request_irq(bank->chip.parent, bank->irq,
+ 			       omap_gpio_irq_handler,
+-			       0, dev_name(bank->chip.parent), bank);
++			       IRQF_OOB, dev_name(bank->chip.parent), bank);
+ 	if (ret)
+ 		gpiochip_remove(&bank->chip);
+ 
+-- 
+2.38.1
+

@@ -1,0 +1,37 @@
+From 9230a8ba3a92823da93031e7ccc776b14e216b6f Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 3 Feb 2019 18:52:19 +0100
+Subject: [PATCH 033/179] pinctrl: msm: irq_pipeline: enable pipelined
+ interrupt control
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/pinctrl/qcom/pinctrl-msm.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/pinctrl/qcom/pinctrl-msm.c b/drivers/pinctrl/qcom/pinctrl-msm.c
+index 37526aa1f..5e1822c37 100644
+--- a/drivers/pinctrl/qcom/pinctrl-msm.c
++++ b/drivers/pinctrl/qcom/pinctrl-msm.c
+@@ -68,7 +68,7 @@ struct msm_pinctrl {
+ 
+ 	bool intr_target_use_scm;
+ 
+-	raw_spinlock_t lock;
++	hard_spinlock_t lock;
+ 
+ 	DECLARE_BITMAP(dual_edge_irqs, MAX_NR_GPIO);
+ 	DECLARE_BITMAP(enabled_irqs, MAX_NR_GPIO);
+@@ -1273,7 +1273,8 @@ static int msm_gpio_init(struct msm_pinctrl *pctrl)
+ 	pctrl->irq_chip.irq_set_vcpu_affinity = msm_gpio_irq_set_vcpu_affinity;
+ 	pctrl->irq_chip.flags = IRQCHIP_MASK_ON_SUSPEND |
+ 				IRQCHIP_SET_TYPE_MASKED |
+-				IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND;
++				IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND |
++				IRQCHIP_PIPELINE_SAFE;
+ 
+ 	np = of_parse_phandle(pctrl->dev->of_node, "wakeup-parent", 0);
+ 	if (np) {
+-- 
+2.38.1
+

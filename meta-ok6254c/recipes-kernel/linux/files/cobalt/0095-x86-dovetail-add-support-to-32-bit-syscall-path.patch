@@ -1,0 +1,63 @@
+From d5c3c0d1db056e6aea00a88eadbd8cc632ca6b88 Mon Sep 17 00:00:00 2001
+From: Jan Kiszka <jan.kiszka@siemens.com>
+Date: Wed, 10 Mar 2021 16:51:34 +0100
+Subject: [PATCH 095/179] x86: dovetail: add support to 32-bit syscall path
+
+Analogously to do_syscall_64.
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+---
+ arch/x86/entry/common.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/arch/x86/entry/common.c b/arch/x86/entry/common.c
+index dd901cfd1..9fdc77ae7 100644
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -99,11 +99,22 @@ __visible noinstr void do_int80_syscall_32(struct pt_regs *regs)
+ 	 * or may not be necessary, but it matches the old asm behavior.
+ 	 */
+ 	nr = (unsigned int)syscall_enter_from_user_mode(regs, nr);
++
++	if (dovetailing()) {
++		if (nr == EXIT_SYSCALL_OOB) {
++			hard_local_irq_disable();
++			return;
++		}
++		if (nr == EXIT_SYSCALL_TAIL)
++			goto done;
++	}
++
+ 	instrumentation_begin();
+ 
+ 	do_syscall_32_irqs_on(regs, nr);
+ 
+ 	instrumentation_end();
++done:
+ 	syscall_exit_to_user_mode(regs);
+ }
+ 
+@@ -146,9 +157,20 @@ static noinstr bool __do_fast_syscall_32(struct pt_regs *regs)
+ 	/* The case truncates any ptrace induced syscall nr > 2^32 -1 */
+ 	nr = (unsigned int)syscall_enter_from_user_mode_work(regs, nr);
+ 
++	if (dovetailing()) {
++		if (nr == EXIT_SYSCALL_OOB) {
++			instrumentation_end();
++			hard_local_irq_disable();
++			return true;
++		}
++		if (nr == EXIT_SYSCALL_TAIL)
++			goto done;
++	}
++
+ 	/* Now this is just like a normal syscall. */
+ 	do_syscall_32_irqs_on(regs, nr);
+ 
++done:
+ 	instrumentation_end();
+ 	syscall_exit_to_user_mode(regs);
+ 	return true;
+-- 
+2.38.1
+

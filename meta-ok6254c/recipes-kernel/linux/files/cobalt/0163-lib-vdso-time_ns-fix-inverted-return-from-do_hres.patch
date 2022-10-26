@@ -1,0 +1,26 @@
+From fad2f7b5b0a294d2354bca7247c1e441a63af744 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Wed, 8 Jun 2022 18:16:14 +0200
+Subject: [PATCH 163/179] lib/vdso: time_ns: fix inverted return from do_hres()
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ lib/vdso/gettimeofday.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/vdso/gettimeofday.c b/lib/vdso/gettimeofday.c
+index 6b02f792e..c9d85544a 100644
+--- a/lib/vdso/gettimeofday.c
++++ b/lib/vdso/gettimeofday.c
+@@ -350,7 +350,7 @@ static __always_inline int do_hres(const struct vdso_data *vd, clockid_t clk,
+ 		while (unlikely((seq = READ_ONCE(vd->seq)) & 1)) {
+ 			if (IS_ENABLED(CONFIG_TIME_NS) &&
+ 				vd->clock_mode == VDSO_CLOCKMODE_TIMENS)
+-				return !do_hres_timens(vd, clk, ts);
++				return do_hres_timens(vd, clk, ts);
+ 			cpu_relax();
+ 		}
+ 
+-- 
+2.38.1
+

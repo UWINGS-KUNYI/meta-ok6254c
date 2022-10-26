@@ -11,6 +11,7 @@ require recipes-kernel/linux/ti-uio.inc
 require recipes-kernel/linux/bundle-devicetree.inc
 require recipes-kernel/linux/kernel-rdepends.inc
 require recipes-kernel/linux/ti-kernel.inc
+require recipes-kernel/linux/xenomai-patch.inc
 
 DEPENDS += "gmp-native libmpc-native"
 
@@ -35,7 +36,8 @@ KERNEL_GIT_URI = "git://github.com/UWINGS-KUNYI/ti-kernel.git"
 KERNEL_GIT_PROTOCOL = "https"
 SRC_URI += "${KERNEL_GIT_URI};protocol=${KERNEL_GIT_PROTOCOL};branch=${BRANCH} \
 	    file://defconfig \
-           "
+	    ${XENOMAI_DOVETAIL} \
+	   "
 
 FILES:${KERNEL_PACKAGE_NAME}-devicetree += "/${KERNEL_IMAGEDEST}/*.itb"
 

@@ -1,0 +1,53 @@
+From c27866c279bb20dcc13f8f2de93449418c13c328 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Wed, 8 Jun 2022 18:21:45 +0200
+Subject: [PATCH 162/179] lib/vdso: fix build in COMPAT mode
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ include/vdso/datapage.h | 2 +-
+ include/vdso/helpers.h  | 1 -
+ lib/vdso/gettimeofday.c | 2 +-
+ 3 files changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/include/vdso/datapage.h b/include/vdso/datapage.h
+index c93bf8cfe..e2cd1e888 100644
+--- a/include/vdso/datapage.h
++++ b/include/vdso/datapage.h
+@@ -114,7 +114,7 @@ struct vdso_data {
+ 	struct arch_vdso_data	arch_data;
+ };
+ 
+-#ifdef CONFIG_GENERIC_CLOCKSOURCE_VDSO
++#if defined(CONFIG_GENERIC_CLOCKSOURCE_VDSO) && !defined(ENABLE_COMPAT_VDSO)
+ 
+ #include <linux/clocksource.h>
+ 
+diff --git a/include/vdso/helpers.h b/include/vdso/helpers.h
+index cb52078db..9a2af9fca 100644
+--- a/include/vdso/helpers.h
++++ b/include/vdso/helpers.h
+@@ -5,7 +5,6 @@
+ #ifndef __ASSEMBLY__
+ 
+ #include <vdso/datapage.h>
+-#include <linux/irq_pipeline.h>
+ 
+ static __always_inline u32 vdso_read_begin(const struct vdso_data *vd)
+ {
+diff --git a/lib/vdso/gettimeofday.c b/lib/vdso/gettimeofday.c
+index 1136bfaf6..6b02f792e 100644
+--- a/lib/vdso/gettimeofday.c
++++ b/lib/vdso/gettimeofday.c
+@@ -22,7 +22,7 @@ static inline bool vdso_cycles_ok(u64 cycles)
+ }
+ #endif
+ 
+-#ifdef CONFIG_GENERIC_CLOCKSOURCE_VDSO
++#if defined(CONFIG_GENERIC_CLOCKSOURCE_VDSO) && !defined(BUILD_VDSO32)
+ 
+ #include <linux/fcntl.h>
+ #include <linux/io.h>
+-- 
+2.38.1
+

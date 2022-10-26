@@ -1,0 +1,27 @@
+From ed5f1725a4e6c8c1486c7fab5d2ebc4d256a0529 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Fri, 12 Aug 2022 19:18:33 +0200
+Subject: [PATCH 178/179] irqchip/gic-v3-mbi: irq_pipeline: advertise immediate
+ readiness
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/irqchip/irq-gic-v3-mbi.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/irqchip/irq-gic-v3-mbi.c b/drivers/irqchip/irq-gic-v3-mbi.c
+index e81e89a81..b213cd755 100644
+--- a/drivers/irqchip/irq-gic-v3-mbi.c
++++ b/drivers/irqchip/irq-gic-v3-mbi.c
+@@ -216,7 +216,7 @@ static struct irq_chip mbi_pmsi_irq_chip = {
+ 	.name			= "pMSI",
+ 	.irq_set_type		= irq_chip_set_type_parent,
+ 	.irq_compose_msi_msg	= mbi_compose_mbi_msg,
+-	.flags			= IRQCHIP_SUPPORTS_LEVEL_MSI,
++	.flags			= IRQCHIP_SUPPORTS_LEVEL_MSI | IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static struct msi_domain_ops mbi_pmsi_ops = {
+-- 
+2.38.1
+

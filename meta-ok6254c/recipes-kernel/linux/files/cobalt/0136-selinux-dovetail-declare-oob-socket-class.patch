@@ -1,0 +1,50 @@
+From e11b09f53fb4ba1620b2daacb22733c4d6baeb7b Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sat, 28 Aug 2021 12:30:59 +0200
+Subject: [PATCH 136/179] selinux: dovetail: declare oob socket class
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ security/selinux/hooks.c            | 4 +++-
+ security/selinux/include/classmap.h | 4 +++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index f98a5b954aef..aa6e5f7b2338 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -1281,7 +1281,9 @@ static inline u16 socket_type_to_security_class(int family, int type, int protoc
+ 			return SECCLASS_XDP_SOCKET;
+ 		case PF_RPMSG:
+ 			return SECCLASS_RPMSG_SOCKET;
+-#if PF_MAX > 46
++                case PF_OOB:
++                        return SECCLASS_OOB_SOCKET;
++#if PF_MAX > 47
+ #error New address family defined, please update this function.
+ #endif
+ 		}
+diff --git a/security/selinux/include/classmap.h b/security/selinux/include/classmap.h
+index 6c8a6d2769df..2112f07c36c7 100644
+--- a/security/selinux/include/classmap.h
++++ b/security/selinux/include/classmap.h
+@@ -248,6 +248,8 @@ struct security_class_mapping secclass_map[] = {
+ 	    NULL } },
+ 	{ "xdp_socket",
+ 	  { COMMON_SOCK_PERMS, NULL } },
++	{ "oob_socket",
++	  { COMMON_SOCK_PERMS, NULL } },
+ 	{ "perf_event",
+ 	  { "open", "cpu", "kernel", "tracepoint", "read", "write", NULL } },
+ 	{ "lockdown",
+@@ -255,6 +257,6 @@ struct security_class_mapping secclass_map[] = {
+ 	{ NULL }
+   };
+ 
+-#if PF_MAX > 46
++#if PF_MAX > 47
+ #error New address family defined, please update secclass_map.
+ #endif
+- 
+2.38.1
+

@@ -1,0 +1,191 @@
+From f08aaf9a7111333aec67658320692196399abefd Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 12 May 2020 17:55:17 +0200
+Subject: [PATCH 060/179] ARM: dovetail: enable alternate scheduling
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm/include/asm/dovetail.h    | 13 ++++++++++
+ arch/arm/include/asm/efi.h         |  4 +++
+ arch/arm/include/asm/mmu_context.h | 40 +++++++++++++++++++++++-------
+ arch/arm/mm/context.c              | 18 ++++++++------
+ 4 files changed, 59 insertions(+), 16 deletions(-)
+
+diff --git a/arch/arm/include/asm/dovetail.h b/arch/arm/include/asm/dovetail.h
+index 84abff122..8f3a09391 100644
+--- a/arch/arm/include/asm/dovetail.h
++++ b/arch/arm/include/asm/dovetail.h
+@@ -17,4 +17,17 @@
+ #define ARM_TRAP_UNDEFINSTR	7	/* Undefined instruction */
+ #define ARM_TRAP_ALIGNMENT	8	/* Unaligned access exception */
+ 
++#if !defined(__ASSEMBLY__) && defined(CONFIG_DOVETAIL)
++
++static inline void arch_dovetail_exec_prepare(void)
++{ }
++
++static inline void arch_dovetail_switch_prepare(bool leave_inband)
++{ }
++
++static inline void arch_dovetail_switch_finish(bool enter_inband)
++{ }
++
++#endif
++
+ #endif /* _ASM_ARM_DOVETAIL_H */
+diff --git a/arch/arm/include/asm/efi.h b/arch/arm/include/asm/efi.h
+index 3ee4f4381..dedafc6f7 100644
+--- a/arch/arm/include/asm/efi.h
++++ b/arch/arm/include/asm/efi.h
+@@ -37,7 +37,11 @@ int efi_set_mapping_permissions(struct mm_struct *mm, efi_memory_desc_t *md);
+ 
+ static inline void efi_set_pgd(struct mm_struct *mm)
+ {
++	unsigned long flags;
++
++	protect_inband_mm(flags);
+ 	check_and_switch_context(mm, NULL);
++	unprotect_inband_mm(flags);
+ }
+ 
+ void efi_virtmap_load(void);
+diff --git a/arch/arm/include/asm/mmu_context.h b/arch/arm/include/asm/mmu_context.h
+index f99ed524f..32cded3e5 100644
+--- a/arch/arm/include/asm/mmu_context.h
++++ b/arch/arm/include/asm/mmu_context.h
+@@ -14,6 +14,7 @@
+ #include <linux/sched.h>
+ #include <linux/mm_types.h>
+ #include <linux/preempt.h>
++#include <linux/irq_pipeline.h>
+ 
+ #include <asm/cacheflush.h>
+ #include <asm/cachetype.h>
+@@ -72,6 +73,7 @@ static inline void check_and_switch_context(struct mm_struct *mm,
+ static inline void finish_arch_post_lock_switch(void)
+ {
+ 	struct mm_struct *mm = current->mm;
++	unsigned long flags;
+ 
+ 	if (mm && mm->context.switch_pending) {
+ 		/*
+@@ -83,7 +85,9 @@ static inline void finish_arch_post_lock_switch(void)
+ 		preempt_disable();
+ 		if (mm->context.switch_pending) {
+ 			mm->context.switch_pending = 0;
++			protect_inband_mm(flags);
+ 			cpu_switch_mm(mm->pgd, mm);
++			unprotect_inband_mm(flags);
+ 		}
+ 		preempt_enable_no_resched();
+ 	}
+@@ -102,7 +106,7 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ #endif	/* CONFIG_CPU_HAS_ASID */
+ 
+ #define destroy_context(mm)		do { } while(0)
+-#define activate_mm(prev,next)		switch_mm(prev, next, NULL)
++#define activate_mm(prev,next)		__switch_mm(prev, next, NULL)
+ 
+ /*
+  * This is called when "tsk" is about to enter lazy TLB mode.
+@@ -118,15 +122,9 @@ enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ {
+ }
+ 
+-/*
+- * This is the actual mm switch as far as the scheduler
+- * is concerned.  No registers are touched.  We avoid
+- * calling the CPU specific function when the mm hasn't
+- * actually changed.
+- */
+ static inline void
+-switch_mm(struct mm_struct *prev, struct mm_struct *next,
+-	  struct task_struct *tsk)
++__switch_mm(struct mm_struct *prev, struct mm_struct *next,
++	    struct task_struct *tsk)
+ {
+ #ifdef CONFIG_MMU
+ 	unsigned int cpu = smp_processor_id();
+@@ -149,6 +147,30 @@ switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ #endif
+ }
+ 
++/*
++ * This is the actual mm switch as far as the scheduler
++ * is concerned.  No registers are touched.  We avoid
++ * calling the CPU specific function when the mm hasn't
++ * actually changed.
++ */
++static inline void
++switch_mm(struct mm_struct *prev, struct mm_struct *next,
++	  struct task_struct *tsk)
++{
++	unsigned long flags;
++
++	protect_inband_mm(flags);
++	__switch_mm(prev, next, tsk);
++	unprotect_inband_mm(flags);
++}
++
+ #define deactivate_mm(tsk,mm)	do { } while (0)
+ 
++static inline void
++switch_oob_mm(struct mm_struct *prev, struct mm_struct *next,
++	      struct task_struct *tsk)
++{
++	__switch_mm(prev, next, tsk);
++}
++
+ #endif
+diff --git a/arch/arm/mm/context.c b/arch/arm/mm/context.c
+index b7525b433..0cf14bd0c 100644
+--- a/arch/arm/mm/context.c
++++ b/arch/arm/mm/context.c
+@@ -39,7 +39,7 @@
+ #define ASID_FIRST_VERSION	(1ULL << ASID_BITS)
+ #define NUM_USER_ASIDS		ASID_FIRST_VERSION
+ 
+-static DEFINE_RAW_SPINLOCK(cpu_asid_lock);
++static DEFINE_HARD_SPINLOCK(cpu_asid_lock);
+ static atomic64_t asid_generation = ATOMIC64_INIT(ASID_FIRST_VERSION);
+ static DECLARE_BITMAP(asid_map, NUM_USER_ASIDS);
+ 
+@@ -237,9 +237,12 @@ static u64 new_context(struct mm_struct *mm, unsigned int cpu)
+ void check_and_switch_context(struct mm_struct *mm, struct task_struct *tsk)
+ {
+ 	unsigned long flags;
+-	unsigned int cpu = smp_processor_id();
++	unsigned int cpu = raw_smp_processor_id();
++	bool need_flush;
+ 	u64 asid;
+ 
++	WARN_ON_ONCE(dovetail_debug() && !hard_irqs_disabled());
++
+ 	if (unlikely(mm->context.vmalloc_seq != init_mm.context.vmalloc_seq))
+ 		__check_vmalloc_seq(mm);
+ 
+@@ -263,15 +266,16 @@ void check_and_switch_context(struct mm_struct *mm, struct task_struct *tsk)
+ 		atomic64_set(&mm->context.id, asid);
+ 	}
+ 
+-	if (cpumask_test_and_clear_cpu(cpu, &tlb_flush_pending)) {
+-		local_flush_bp_all();
+-		local_flush_tlb_all();
+-	}
+-
++	need_flush = cpumask_test_and_clear_cpu(cpu, &tlb_flush_pending);
+ 	atomic64_set(&per_cpu(active_asids, cpu), asid);
+ 	cpumask_set_cpu(cpu, mm_cpumask(mm));
+ 	raw_spin_unlock_irqrestore(&cpu_asid_lock, flags);
+ 
++	if (need_flush) {
++		local_flush_bp_all();
++		local_flush_tlb_all();
++	}
++
+ switch_mm_fastpath:
+ 	cpu_switch_mm(mm->pgd, mm);
+ }
+-- 
+2.38.1
+

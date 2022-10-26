@@ -1,0 +1,44 @@
+From 2b1901b250918578de4ebd7325e8b92930aaaefe Mon Sep 17 00:00:00 2001
+From: leo <vtk-powerlab@yandex.ru>
+Date: Tue, 24 Dec 2019 19:12:40 +0100
+Subject: [PATCH 050/179] clocksource/sun4i: irq_pipeline: enable pipelined
+ clock events
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/clocksource/timer-sun4i.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/clocksource/timer-sun4i.c b/drivers/clocksource/timer-sun4i.c
+index 0ba8155b8..43886c355 100644
+--- a/drivers/clocksource/timer-sun4i.c
++++ b/drivers/clocksource/timer-sun4i.c
+@@ -19,6 +19,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/irqreturn.h>
++#include <linux/dovetail.h>
+ #include <linux/sched_clock.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -135,7 +136,7 @@ static irqreturn_t sun4i_timer_interrupt(int irq, void *dev_id)
+ 	struct timer_of *to = to_timer_of(evt);
+ 
+ 	sun4i_timer_clear_interrupt(timer_of_base(to));
+-	evt->event_handler(evt);
++	clockevents_handle_event(evt);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -146,7 +147,7 @@ static struct timer_of to = {
+ 	.clkevt = {
+ 		.name = "sun4i_tick",
+ 		.rating = 350,
+-		.features = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT,
++		.features = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT | CLOCK_EVT_FEAT_PIPELINE,
+ 		.set_state_shutdown = sun4i_clkevt_shutdown,
+ 		.set_state_periodic = sun4i_clkevt_set_periodic,
+ 		.set_state_oneshot = sun4i_clkevt_set_oneshot,
+-- 
+2.38.1
+

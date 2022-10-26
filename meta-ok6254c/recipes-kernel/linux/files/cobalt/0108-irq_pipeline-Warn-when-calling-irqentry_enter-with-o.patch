@@ -1,0 +1,30 @@
+From 86bb64eec02af8c59cc9ec088976adaae04974cf Mon Sep 17 00:00:00 2001
+From: Jan Kiszka <jan.kiszka@siemens.com>
+Date: Mon, 7 Jun 2021 08:19:39 +0200
+Subject: [PATCH 108/179] irq_pipeline: Warn when calling irqentry_enter with
+ oob stalled
+
+Something must have went wrong if entering for an IRQ or an exception
+over oob and with this stage stalled. Warn when debugging
+
+Suggest-by: Philippe Gerum <rpm@xenomai.org>
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+---
+ kernel/entry/common.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/kernel/entry/common.c b/kernel/entry/common.c
+index bfd85c581..4e81c0c03 100644
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -365,6 +365,7 @@ noinstr irqentry_state_t irqentry_enter(struct pt_regs *regs)
+ 
+ #ifdef CONFIG_IRQ_PIPELINE
+ 	if (running_oob()) {
++		WARN_ON_ONCE(irq_pipeline_debug() && oob_irqs_disabled());
+ 		ret.stage_info = IRQENTRY_OOB;
+ 		return ret;
+ 	}
+-- 
+2.38.1
+

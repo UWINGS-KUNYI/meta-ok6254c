@@ -1,0 +1,72 @@
+From 66b4fa6c2cadeb34d197e3f15abd0891ee0d0a08 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sat, 23 Jul 2022 10:38:25 +0200
+Subject: [PATCH 171/179] net: dovetail: copy oob flags on clone
+
+We need the oob bit flags to be copied on cloning skbs, so that we
+don't do UMR for non-oob buffers, which might otherwise cause those
+bits to be raised unexpectedly for regular buffers.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ include/linux/skbuff.h | 17 +++++++++++++++--
+ net/core/skbuff.c      |  1 +
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 97bde8a06..8f992959b 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1088,6 +1088,14 @@ struct sk_buff *build_skb_around(struct sk_buff *skb,
+ 				 void *data, unsigned int frag_size);
+ #ifdef CONFIG_NET_OOB
+ 
++static inline void __skb_oob_copy(struct sk_buff *new,
++				const struct sk_buff *old)
++{
++	new->oob = old->oob;
++	new->oob_clone = old->oob_clone;
++	new->oob_cloned = old->oob_cloned;
++}
++
+ static inline bool skb_is_oob(const struct sk_buff *skb)
+ {
+ 	return skb->oob;
+@@ -1123,7 +1131,12 @@ static inline bool recycle_oob_skb(struct sk_buff *skb)
+ 	return skb_oob_recycle(skb);
+ }
+ 
+-#else
++#else  /* !CONFIG_NET_OOB */
++
++static inline void __skb_oob_copy(struct sk_buff *new,
++				const struct sk_buff *old)
++{
++}
+ 
+ static inline bool skb_is_oob(const struct sk_buff *skb)
+ {
+@@ -1135,7 +1148,7 @@ static inline bool recycle_oob_skb(struct sk_buff *skb)
+ 	return false;
+ }
+ 
+-#endif
++#endif	/* !CONFIG_NET_OOB */
+ 
+ /**
+  * alloc_skb - allocate a network buffer
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 1cfa53f77..fdcf4c3cd 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1058,6 +1058,7 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+ 	skb_dst_copy(new, old);
+ 	__skb_ext_copy(new, old);
+ 	__nf_copy(new, old, false);
++	__skb_oob_copy(new, old);
+ 
+ 	/* Note : this field could be in headers_start/headers_end section
+ 	 * It is not yet because we do not want to have a 16 bit hole
+-- 
+2.38.1
+

@@ -1,0 +1,31 @@
+From b180c492c4dfa05cb1e7bf7198b83213da08eca5 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Wed, 24 Mar 2021 14:53:31 +0100
+Subject: [PATCH 102/179] genirq: irq_pipeline: no trigger in
+ lockdep_assert_irqs_disabled() if hardirqs off
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ include/linux/lockdep.h | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/lockdep.h b/include/linux/lockdep.h
+index 04d5cf38e..80db2089f 100644
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@ -587,10 +587,8 @@ do {									\
+ 
+ #define lockdep_assert_irqs_disabled()					\
+ do {									\
+-	WARN_ON_ONCE(__lockdep_enabled &&				\
+-		((running_oob() && !hard_irqs_disabled()) ||		\
+-		(running_inband() && this_cpu_read(hardirqs_enabled) &&\
+-		 (!irqs_pipelined() || !hard_irqs_disabled()))));	\
++	WARN_ON_ONCE(__lockdep_enabled && !hard_irqs_disabled() &&	\
++		(running_oob() || this_cpu_read(hardirqs_enabled)));	\
+ } while (0)
+ 
+ #define lockdep_save_irqs_state(__state)				\
+-- 
+2.38.1
+

@@ -1,0 +1,36 @@
+From 2285f0f9fd901cf2fcb32ca0e6a098106ce6463f Mon Sep 17 00:00:00 2001
+From: Jan Kiszka <jan.kiszka@siemens.com>
+Date: Mon, 7 Jun 2021 08:19:38 +0200
+Subject: [PATCH 107/179] irq_pipeline: Account for stage migration across
+ faults
+
+We need to unstall the inband stage when we entered for a fault over OOB
+and then migrated to inband. So far we kept the inband stage stalled,
+causing a state corruption this way.
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+---
+ kernel/entry/common.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/entry/common.c b/kernel/entry/common.c
+index 47bc0e460..bfd85c581 100644
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -524,9 +524,11 @@ noinstr void irqentry_exit(struct pt_regs *regs, irqentry_state_t state)
+ 	/*
+ 	 * If pipelining interrupts, clear the in-band stall bit if
+ 	 * irqentry_enter() raised it in order to mirror the hardware
+-	 * state.
++	 * state. Also clear it when we where coming from oob, thus went
++	 * through a migration that was caused by taking, e.g., a fault.
+ 	 */
+-	if (state.stage_info == IRQENTRY_INBAND_UNSTALLED)
++	if (state.stage_info == IRQENTRY_INBAND_UNSTALLED ||
++	    state.stage_info == IRQENTRY_OOB)
+ 		unstall_inband();
+ #endif
+ 	return;
+-- 
+2.38.1
+

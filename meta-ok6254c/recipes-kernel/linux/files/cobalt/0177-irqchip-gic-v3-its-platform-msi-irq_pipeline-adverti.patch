@@ -1,0 +1,26 @@
+From d8dfc98f9bdbc9108f38663e4550b4b2f4896ae2 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Fri, 12 Aug 2022 19:18:15 +0200
+Subject: [PATCH 177/179] irqchip/gic-v3-its-platform-msi: irq_pipeline:
+ advertise immediate readiness
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/irqchip/irq-gic-v3-its-platform-msi.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/irqchip/irq-gic-v3-its-platform-msi.c b/drivers/irqchip/irq-gic-v3-its-platform-msi.c
+index daa6d5053..ae29443e9 100644
+--- a/drivers/irqchip/irq-gic-v3-its-platform-msi.c
++++ b/drivers/irqchip/irq-gic-v3-its-platform-msi.c
+@@ -12,6 +12,7 @@
+ 
+ static struct irq_chip its_pmsi_irq_chip = {
+ 	.name			= "ITS-pMSI",
++	.flags			= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static int of_pmsi_get_dev_id(struct irq_domain *domain, struct device *dev,
+-- 
+2.38.1
+

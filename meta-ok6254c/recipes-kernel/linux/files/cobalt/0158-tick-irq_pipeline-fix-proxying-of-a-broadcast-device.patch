@@ -1,0 +1,124 @@
+From 1b51e14e8bdcc17b07ac67a3adbd621ef24f2f49 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 3 Apr 2022 11:52:48 +0200
+Subject: [PATCH 158/179] tick: irq_pipeline: fix proxying of a broadcast
+ device
+
+When a proxy device is taking control of a (real) broadcast device, we
+have to:
+
+- remove the real device from the clockevents_list
+- keep that device ticking, i.e. no shutdown
+
+Fix tick_check_new_device() accordingly.
+
+Reviewed-by: Richard Weinberger <richard@nod.at>
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ kernel/time/clockevents.c   |  9 +++++++--
+ kernel/time/tick-common.c   | 21 +++++++++------------
+ kernel/time/tick-internal.h |  8 ++++++++
+ kernel/time/tick-proxy.c    |  2 +-
+ 4 files changed, 25 insertions(+), 15 deletions(-)
+
+diff --git a/kernel/time/clockevents.c b/kernel/time/clockevents.c
+index fbe9ef4c6..2651c6cfd 100644
+--- a/kernel/time/clockevents.c
++++ b/kernel/time/clockevents.c
+@@ -639,8 +639,13 @@ void clockevents_exchange_device(struct clock_event_device *old,
+ 	 */
+ 	if (old) {
+ 		module_put(old->owner);
+-		list_del(&old->list);
+-		if (new && new->features & CLOCK_EVT_FEAT_PROXY) {
++		/*
++		 * Do not move the device backing a proxy tick device
++		 * to the release list, keep it around but mark it as
++		 * reserved.
++		 */
++		if (tick_check_is_proxy(new)) {
++			list_del(&old->list);
+ 			clockevents_switch_state(old, CLOCK_EVT_STATE_RESERVED);
+ 		} else {
+ 			clockevents_switch_state(old, CLOCK_EVT_STATE_DETACHED);
+diff --git a/kernel/time/tick-common.c b/kernel/time/tick-common.c
+index 38b0fcb9c..8f01708cd 100644
+--- a/kernel/time/tick-common.c
++++ b/kernel/time/tick-common.c
+@@ -322,17 +322,6 @@ static bool tick_check_preferred(struct clock_event_device *curdev,
+ 	       !cpumask_equal(curdev->cpumask, newdev->cpumask);
+ }
+ 
+-static bool tick_check_is_proxy(struct clock_event_device *curdev)
+-{
+-	if (!irqs_pipelined())
+-		return false;
+-
+-	/*
+-	 * Never replace an active proxy except when unregistering it.
+-	 */
+-	return curdev && curdev->features & CLOCK_EVT_FEAT_PROXY;
+-}
+-
+ /*
+  * Check whether the new device is a better fit than curdev. curdev
+  * can be NULL !
+@@ -340,6 +329,9 @@ static bool tick_check_is_proxy(struct clock_event_device *curdev)
+ bool tick_check_replacement(struct clock_event_device *curdev,
+ 			    struct clock_event_device *newdev)
+ {
++	/*
++	 * Never replace an active proxy except when unregistering it.
++	 */
+ 	if (tick_check_is_proxy(curdev))
+ 		return false;
+ 
+@@ -383,7 +375,12 @@ void tick_check_new_device(struct clock_event_device *newdev)
+ 	 * not give it back to the clockevents layer !
+ 	 */
+ 	if (tick_is_broadcast_device(curdev)) {
+-		clockevents_shutdown(curdev);
++		if (tick_check_is_proxy(newdev)) {
++			list_del(&curdev->list);
++			clockevents_switch_state(curdev, CLOCK_EVT_STATE_RESERVED);
++		} else {
++			clockevents_shutdown(curdev);
++		}
+ 		curdev = NULL;
+ 	}
+ 	clockevents_exchange_device(curdev, newdev);
+diff --git a/kernel/time/tick-internal.h b/kernel/time/tick-internal.h
+index fc034e72f..511803157 100644
+--- a/kernel/time/tick-internal.h
++++ b/kernel/time/tick-internal.h
+@@ -48,6 +48,14 @@ static inline void clockevent_set_state(struct clock_event_device *dev,
+ 	dev->state_use_accessors = state;
+ }
+ 
++static inline bool tick_check_is_proxy(struct clock_event_device *dev)
++{
++	if (!irqs_pipelined())
++		return false;
++
++	return dev && dev->features & CLOCK_EVT_FEAT_PROXY;
++}
++
+ extern void clockevents_shutdown(struct clock_event_device *dev);
+ extern void clockevents_exchange_device(struct clock_event_device *old,
+ 					struct clock_event_device *new);
+diff --git a/kernel/time/tick-proxy.c b/kernel/time/tick-proxy.c
+index 84aab8bcc..5a877987a 100644
+--- a/kernel/time/tick-proxy.c
++++ b/kernel/time/tick-proxy.c
+@@ -285,7 +285,7 @@ static int enable_oob_timer(void *arg) /* hard_irqs_disabled() */
+ 
+ 	/*
+ 	 * irq_switch_oob() grabs the IRQ descriptor lock which is
+-	 * mutable, so that is fine to invoke this routine with hard
++	 * hybrid, so that is fine to invoke this routine with hard
+ 	 * IRQs off.
+ 	 */
+ 	irq_switch_oob(real_dev->irq, true);
+-- 
+2.38.1
+

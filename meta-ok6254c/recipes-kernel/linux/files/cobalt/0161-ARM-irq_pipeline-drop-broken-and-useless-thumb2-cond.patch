@@ -1,0 +1,39 @@
+From 4b0d5937030729eb8311d646b8440786534c95b9 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sat, 4 Jun 2022 16:11:32 +0200
+Subject: [PATCH 161/179] ARM: irq_pipeline: drop broken and useless thumb2
+ conditional
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm/kernel/entry-armv.S   | 1 -
+ arch/arm/kernel/entry-header.S | 1 -
+ 2 files changed, 2 deletions(-)
+
+diff --git a/arch/arm/kernel/entry-armv.S b/arch/arm/kernel/entry-armv.S
+index 43df1be6f..a3932c69a 100644
+--- a/arch/arm/kernel/entry-armv.S
++++ b/arch/arm/kernel/entry-armv.S
+@@ -465,7 +465,6 @@ __irq_usr:
+ 	irq_handler
+ 	mov	why, #0
+ #ifdef CONFIG_IRQ_PIPELINE
+-THUMB(	it ne)
+ 	tst	r0, r0
+ 	beq	fast_ret_to_user	@ skip epilogue if oob (in-band cannot be stalled)
+ #endif
+diff --git a/arch/arm/kernel/entry-header.S b/arch/arm/kernel/entry-header.S
+index efeaae7c1..da1251c4e 100644
+--- a/arch/arm/kernel/entry-header.S
++++ b/arch/arm/kernel/entry-header.S
+@@ -414,7 +414,6 @@
+ 	.macro ret_to_user_pipelined, tmp
+ #ifdef CONFIG_IRQ_PIPELINE
+ 	ldr	\tmp, [tsk, #TI_LOCAL_FLAGS]
+-THUMB(	it ne)
+ 	tst	\tmp, #_TLF_OOB
+ 	bne	fast_ret_to_user
+ #endif
+-- 
+2.38.1
+

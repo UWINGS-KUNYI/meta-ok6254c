@@ -1,0 +1,28 @@
+From 7f16644829b31b2e62adf31518242b2db505654e Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sat, 6 Feb 2021 10:53:35 +0100
+Subject: [PATCH 092/179] ARM: dovetail: fix compat mode branch
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm/kernel/entry-common.S | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/kernel/entry-common.S b/arch/arm/kernel/entry-common.S
+index effd613a3..8112ebb89 100644
+--- a/arch/arm/kernel/entry-common.S
++++ b/arch/arm/kernel/entry-common.S
+@@ -287,8 +287,8 @@ local_restart:
+ 	ldr	r0, =#0xf0042			@ old syscall signature
+ 	cmp	scno, r0
+ 	bne	1f
+-	or	scno, scno, #__OOB_SYSCALL_BIT	@ force in oob marker
+-	b	fastcall_entry
++	add	scno, scno, #__OOB_SYSCALL_BIT	@ force in oob marker
++	b	fastcall_try
+ 1:
+ #endif	
+ 	ldr	r0, =#__OOB_SYSCALL_BIT
+-- 
+2.38.1
+

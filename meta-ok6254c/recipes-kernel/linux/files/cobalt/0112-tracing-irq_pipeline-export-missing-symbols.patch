@@ -1,0 +1,51 @@
+From 94ee5188e97f2d04535e88585309d8475c8b052b Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 10 Jun 2021 09:27:21 +0200
+Subject: [PATCH 112/179] tracing: irq_pipeline: export missing symbols
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ kernel/trace/trace_preemptirq.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/kernel/trace/trace_preemptirq.c b/kernel/trace/trace_preemptirq.c
+index 261ea4101..2b4110cf6 100644
+--- a/kernel/trace/trace_preemptirq.c
++++ b/kernel/trace/trace_preemptirq.c
+@@ -124,6 +124,8 @@ void trace_hardirqs_off_pipelined(void)
+ 	if (running_inband())
+ 		trace_hardirqs_off();
+ }
++EXPORT_SYMBOL(trace_hardirqs_off_pipelined);
++NOKPROBE_SYMBOL(trace_hardirqs_off_pipelined);
+ 
+ void trace_hardirqs_on_pipelined(void)
+ {
+@@ -142,6 +144,8 @@ void trace_hardirqs_on_pipelined(void)
+ 		unstall_inband_nocheck();
+ 	}
+ }
++EXPORT_SYMBOL(trace_hardirqs_on_pipelined);
++NOKPROBE_SYMBOL(trace_hardirqs_on_pipelined);
+ 
+ #else
+ 
+@@ -149,11 +153,15 @@ void trace_hardirqs_off_pipelined(void)
+ {
+ 	trace_hardirqs_off();
+ }
++EXPORT_SYMBOL(trace_hardirqs_off_pipelined);
++NOKPROBE_SYMBOL(trace_hardirqs_off_pipelined);
+ 
+ void trace_hardirqs_on_pipelined(void)
+ {
+ 	trace_hardirqs_on();
+ }
++EXPORT_SYMBOL(trace_hardirqs_on_pipelined);
++NOKPROBE_SYMBOL(trace_hardirqs_on_pipelined);
+ 
+ #endif
+ 
+-- 
+2.38.1
+

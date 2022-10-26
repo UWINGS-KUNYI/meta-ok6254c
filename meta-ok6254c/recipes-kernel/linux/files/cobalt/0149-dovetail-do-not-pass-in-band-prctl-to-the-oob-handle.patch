@@ -1,0 +1,40 @@
+From ba3874ba33795a97bf3e1902a4df7ed2f20735f1 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 9 Nov 2021 10:22:22 +0100
+Subject: [PATCH 149/179] dovetail: do not pass in-band prctl to the oob
+ handler
+
+Receiving in-band __NR_prctl syscalls via their oob handler may
+confuse some companion cores still using the legacy call form (i.e. nr
+| __OOB_SYSCALL_BIT).
+
+Dig a little deeper into prctl() call args in order to pass oob call
+forms exclusively to handle_oob_syscall().
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ kernel/dovetail.c | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/dovetail.c b/kernel/dovetail.c
+index 794e3998d..92af8d1e1 100644
+--- a/kernel/dovetail.c
++++ b/kernel/dovetail.c
+@@ -172,11 +172,10 @@ static inline bool maybe_oob_syscall(unsigned int nr, struct pt_regs *regs)
+ 	 * Check whether the companion core might be interested in
+ 	 * @nr. Hand the request to the core if __OOB_SYSCALL_BIT is
+ 	 * set in @nr, or this is a prctl() request into which an oob
+-	 * syscall might be folded. If the prctl() call ends up being
+-	 * a regular in-band request, the core should tell us to
+-	 * propagate it to the in-band handler eventually.
++	 * syscall might be folded.
+ 	 */
+-	return (nr & __OOB_SYSCALL_BIT) || nr == __NR_prctl;
++	return (nr & __OOB_SYSCALL_BIT) ||
++		(nr == __NR_prctl && syscall_get_arg0(regs) & __OOB_SYSCALL_BIT);
+ }
+ 
+ int pipeline_syscall(unsigned int nr, struct pt_regs *regs)
+-- 
+2.38.1
+

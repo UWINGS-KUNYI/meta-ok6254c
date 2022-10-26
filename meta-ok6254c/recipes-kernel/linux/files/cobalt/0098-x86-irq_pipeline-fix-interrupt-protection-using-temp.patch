@@ -1,0 +1,66 @@
+From 2592eb95819cc9ff382631c404250d0bd3b69c4a Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 14 Mar 2021 18:18:41 +0100
+Subject: [PATCH 098/179] x86: irq_pipeline: fix interrupt protection using
+ temporary mm
+
+The protection use_temporary_mm() should provide still expects the
+pipeline entry code not to mess up on handling an interrupt, which
+defeats the purpose of such precaution. Besides, the temp_state should
+be snapshot under protection too.
+
+IOW, IRQs should be hard disabled fully while using the temporary
+mm. We may assume that use_temporary_mm() is always called with hard
+irqs on, only at boot time.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/x86/kernel/alternative.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index c4f92c86a..f833ff856 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -1111,7 +1111,6 @@ typedef struct {
+ static inline temp_mm_state_t use_temporary_mm(struct mm_struct *mm)
+ {
+ 	temp_mm_state_t temp_state;
+-	unsigned long flags;
+ 
+ 	lockdep_assert_irqs_disabled();
+ 
+@@ -1123,10 +1122,14 @@ static inline temp_mm_state_t use_temporary_mm(struct mm_struct *mm)
+ 	if (this_cpu_read(cpu_tlbstate.is_lazy))
+ 		leave_mm(smp_processor_id());
+ 
++	/*
++	 * unuse_temporary_mm() assumes hardirqs were off on entry to
++	 * use_temporary_mm(), assert this condition.
++	 */
++	WARN_ON_ONCE(irq_pipeline_debug() && hard_irqs_disabled());
++	hard_cond_local_irq_disable();
+ 	temp_state.mm = this_cpu_read(cpu_tlbstate.loaded_mm);
+-	protect_inband_mm(flags);
+ 	switch_mm_irqs_off(NULL, mm, current);
+-	unprotect_inband_mm(flags);
+ 
+ 	/*
+ 	 * If breakpoints are enabled, disable them while the temporary mm is
+@@ -1147,12 +1150,9 @@ static inline temp_mm_state_t use_temporary_mm(struct mm_struct *mm)
+ 
+ static inline void unuse_temporary_mm(temp_mm_state_t prev_state)
+ {
+-	unsigned long flags;
+-
+ 	lockdep_assert_irqs_disabled();
+-	protect_inband_mm(flags);
+ 	switch_mm_irqs_off(NULL, prev_state.mm, current);
+-	unprotect_inband_mm(flags);
++	hard_cond_local_irq_enable();
+ 
+ 	/*
+ 	 * Restore the breakpoints if they were disabled before the temporary mm
+-- 
+2.38.1
+

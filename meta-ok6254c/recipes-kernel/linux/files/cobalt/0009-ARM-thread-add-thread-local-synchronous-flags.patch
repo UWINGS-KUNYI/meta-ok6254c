@@ -1,0 +1,55 @@
+From 741a48925a7a4111679ca15596eb1a22dc53f6fb Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 11 Dec 2016 16:32:28 +0100
+Subject: [PATCH 009/179] ARM/thread: add thread-local (synchronous) flags
+
+Provide per-thread storage for private flags (i.e. lockless access is
+safe).
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm/include/asm/thread_info.h | 4 ++++
+ arch/arm/kernel/asm-offsets.c      | 1 +
+ 2 files changed, 5 insertions(+)
+
+diff --git a/arch/arm/include/asm/thread_info.h b/arch/arm/include/asm/thread_info.h
+index 536b6b979..23fd72cb9 100644
+--- a/arch/arm/include/asm/thread_info.h
++++ b/arch/arm/include/asm/thread_info.h
+@@ -45,6 +45,7 @@ struct cpu_context_save {
+  */
+ struct thread_info {
+ 	unsigned long		flags;		/* low level flags */
++	__u32			local_flags;	/* local (synchronous) flags */
+ 	int			preempt_count;	/* 0 => preemptable, <0 => bug */
+ 	mm_segment_t		addr_limit;	/* address limit */
+ 	struct task_struct	*task;		/* main task structure */
+@@ -71,10 +72,13 @@ struct thread_info {
+ {									\
+ 	.task		= &tsk,						\
+ 	.flags		= 0,						\
++	.local_flags	= 0,						\
+ 	.preempt_count	= INIT_PREEMPT_COUNT,				\
+ 	.addr_limit	= KERNEL_DS,					\
+ }
+ 
++#define ti_local_flags(__ti)	((__ti)->local_flags)
++
+ /*
+  * how to get the thread information struct from C
+  */
+diff --git a/arch/arm/kernel/asm-offsets.c b/arch/arm/kernel/asm-offsets.c
+index 70993af22..d1320d087 100644
+--- a/arch/arm/kernel/asm-offsets.c
++++ b/arch/arm/kernel/asm-offsets.c
+@@ -42,6 +42,7 @@ int main(void)
+ #endif
+   BLANK();
+   DEFINE(TI_FLAGS,		offsetof(struct thread_info, flags));
++  DEFINE(TI_LOCAL_FLAGS,	offsetof(struct thread_info, local_flags));
+   DEFINE(TI_PREEMPT,		offsetof(struct thread_info, preempt_count));
+   DEFINE(TI_ADDR_LIMIT,		offsetof(struct thread_info, addr_limit));
+   DEFINE(TI_TASK,		offsetof(struct thread_info, task));
+-- 
+2.38.1
+

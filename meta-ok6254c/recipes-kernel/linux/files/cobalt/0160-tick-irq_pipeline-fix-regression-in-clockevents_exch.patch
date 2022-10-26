@@ -1,0 +1,37 @@
+From 2cacc921a2e7c3c100d272fccea789dbf7c71871 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Fri, 8 Apr 2022 10:51:04 +0200
+Subject: [PATCH 160/179] tick: irq_pipeline: fix regression in
+ clockevents_exchange_devices()
+
+The recent change regarding the tick proxy device [1] introduced a
+regression in clockevents_exchange_devices(), causing a corruption of
+the device release list.
+
+This does not affect the logic of the previous fix which remains
+correct though.
+
+[1] tick: irq_pipeline: fix proxying of a broadcast device
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ kernel/time/clockevents.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/time/clockevents.c b/kernel/time/clockevents.c
+index 2651c6cfd..da6735d45 100644
+--- a/kernel/time/clockevents.c
++++ b/kernel/time/clockevents.c
+@@ -644,8 +644,8 @@ void clockevents_exchange_device(struct clock_event_device *old,
+ 		 * to the release list, keep it around but mark it as
+ 		 * reserved.
+ 		 */
++		list_del(&old->list);
+ 		if (tick_check_is_proxy(new)) {
+-			list_del(&old->list);
+ 			clockevents_switch_state(old, CLOCK_EVT_STATE_RESERVED);
+ 		} else {
+ 			clockevents_switch_state(old, CLOCK_EVT_STATE_DETACHED);
+-- 
+2.38.1
+

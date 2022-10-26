@@ -1,0 +1,856 @@
+From ed7c85ffc6f091f8843774ce999cf89fe1d2accc Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 7 May 2019 08:39:26 +0200
+Subject: [PATCH 077/179] x86/fpu: dovetail: enable alternate scheduling
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/x86/include/asm/dovetail.h     |  19 ++++-
+ arch/x86/include/asm/fpu/api.h      |  25 +++++--
+ arch/x86/include/asm/fpu/internal.h |  31 +++++++-
+ arch/x86/include/asm/fpu/types.h    |  12 +++
+ arch/x86/include/asm/pgtable.h      |   5 +-
+ arch/x86/kernel/fpu/core.c          | 111 +++++++++++++++++++++++++---
+ arch/x86/kernel/fpu/signal.c        |  29 ++++----
+ arch/x86/kernel/process_64.c        |   9 ++-
+ arch/x86/kvm/emulate.c              |  65 ++++++++++------
+ arch/x86/kvm/x86.c                  |  12 ++-
+ 10 files changed, 253 insertions(+), 65 deletions(-)
+
+diff --git a/arch/x86/include/asm/dovetail.h b/arch/x86/include/asm/dovetail.h
+index 74b1e5c12..9cf811fe9 100644
+--- a/arch/x86/include/asm/dovetail.h
++++ b/arch/x86/include/asm/dovetail.h
+@@ -8,16 +8,29 @@
+ 
+ #if !defined(__ASSEMBLY__) && defined(CONFIG_DOVETAIL)
+ 
++#include <asm/fpu/api.h>
++
+ static inline void arch_dovetail_exec_prepare(void)
+-{ }
++{
++	clear_thread_flag(TIF_NEED_FPU_LOAD);
++}
+ 
+ static inline
+ void arch_dovetail_switch_prepare(bool leave_inband)
+-{ }
++{
++	if (leave_inband)
++		fpu__suspend_inband();
++}
+ 
+ static inline
+ void arch_dovetail_switch_finish(bool enter_inband)
+-{ }
++{
++	if (enter_inband)
++		fpu__resume_inband();
++	else if (!(current->flags & PF_KTHREAD) &&
++		test_thread_flag(TIF_NEED_FPU_LOAD))
++		switch_fpu_return();
++}
+ 
+ #endif
+ 
+diff --git a/arch/x86/include/asm/fpu/api.h b/arch/x86/include/asm/fpu/api.h
+index 8b9bfaad6..5ef121650 100644
+--- a/arch/x86/include/asm/fpu/api.h
++++ b/arch/x86/include/asm/fpu/api.h
+@@ -41,16 +41,25 @@ static inline void kernel_fpu_begin(void)
+  * fpu->state and set TIF_NEED_FPU_LOAD leaving CPU's FPU registers in
+  * a random state.
+  */
+-static inline void fpregs_lock(void)
++static inline unsigned long fpregs_lock(void)
+ {
+-	preempt_disable();
+-	local_bh_disable();
++	if (IS_ENABLED(CONFIG_IRQ_PIPELINE)) {
++		return hard_preempt_disable();
++	} else {
++		preempt_disable();
++		local_bh_disable();
++		return 0;
++	}
+ }
+ 
+-static inline void fpregs_unlock(void)
++static inline void fpregs_unlock(unsigned long flags)
+ {
+-	local_bh_enable();
+-	preempt_enable();
++	if (IS_ENABLED(CONFIG_IRQ_PIPELINE)) {
++		hard_preempt_enable(flags);
++	} else {
++		local_bh_enable();
++		preempt_enable();
++	}
+ }
+ 
+ #ifdef CONFIG_X86_DEBUG_FPU
+@@ -64,6 +73,10 @@ static inline void fpregs_assert_state_consistent(void) { }
+  */
+ extern void switch_fpu_return(void);
+ 
++/* For Dovetail context switching. */
++void fpu__suspend_inband(void);
++void fpu__resume_inband(void);
++
+ /*
+  * Query the presence of one or more xfeatures. Works on any legacy CPU as well.
+  *
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 70b9bc540..11d31cf64 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -15,6 +15,7 @@
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/mm.h>
++#include <linux/dovetail.h>
+ 
+ #include <asm/user.h>
+ #include <asm/fpu/api.h>
+@@ -509,6 +510,32 @@ static inline void __fpregs_load_activate(void)
+ 	clear_thread_flag(TIF_NEED_FPU_LOAD);
+ }
+ 
++#ifdef CONFIG_DOVETAIL
++
++static inline void oob_fpu_set_preempt(struct fpu *fpu)
++{
++	fpu->preempted = 1;
++}
++
++static inline void oob_fpu_clear_preempt(struct fpu *fpu)
++{
++	fpu->preempted = 0;
++}
++
++static inline bool oob_fpu_preempted(struct fpu *old_fpu)
++{
++	return old_fpu->preempted;
++}
++
++#else
++
++static inline bool oob_fpu_preempted(struct fpu *old_fpu)
++{
++	return false;
++}
++
++#endif	/* !CONFIG_DOVETAIL */
++
+ /*
+  * FPU state switching for scheduling.
+  *
+@@ -535,7 +562,9 @@ static inline void switch_fpu_prepare(struct task_struct *prev, int cpu)
+ {
+ 	struct fpu *old_fpu = &prev->thread.fpu;
+ 
+-	if (static_cpu_has(X86_FEATURE_FPU) && !(prev->flags & PF_KTHREAD)) {
++	if (static_cpu_has(X86_FEATURE_FPU) &&
++		!(prev->flags & PF_KTHREAD) &&
++		!oob_fpu_preempted(old_fpu)) {
+ 		if (!copy_fpregs_to_fpstate(old_fpu))
+ 			old_fpu->last_cpu = -1;
+ 		else
+diff --git a/arch/x86/include/asm/fpu/types.h b/arch/x86/include/asm/fpu/types.h
+index f5a38a5f3..ce2bdebd6 100644
+--- a/arch/x86/include/asm/fpu/types.h
++++ b/arch/x86/include/asm/fpu/types.h
+@@ -329,6 +329,18 @@ struct fpu {
+ 	 */
+ 	unsigned int			last_cpu;
+ 
++#ifdef CONFIG_DOVETAIL
++	/*
++	 * @preempted:
++	 *
++	 * When Dovetail is enabled, this flag is set for the inband
++	 * task context saved when entering a kernel_fpu_begin/end()
++	 * section before the latter got preempted by an out-of-band
++	 * task.
++	 */
++	unsigned char			preempted : 1;
++#endif
++
+ 	/*
+ 	 * @avx512_timestamp:
+ 	 *
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index 87de9f2d7..d4b8b8448 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -137,6 +137,7 @@ static inline u32 read_pkru(void)
+ static inline void write_pkru(u32 pkru)
+ {
+ 	struct pkru_state *pk;
++	unsigned long flags;
+ 
+ 	if (!boot_cpu_has(X86_FEATURE_OSPKE))
+ 		return;
+@@ -148,11 +149,11 @@ static inline void write_pkru(u32 pkru)
+ 	 * written to the CPU. The FPU restore on return to userland would
+ 	 * otherwise load the previous value again.
+ 	 */
+-	fpregs_lock();
++	flags = fpregs_lock();
+ 	if (pk)
+ 		pk->pkru = pkru;
+ 	__write_pkru(pkru);
+-	fpregs_unlock();
++	fpregs_unlock(flags);
+ }
+ 
+ static inline int pte_young(pte_t pte)
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 571220ac8..49e2853a2 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -15,6 +15,7 @@
+ 
+ #include <linux/hardirq.h>
+ #include <linux/pkeys.h>
++#include <linux/cpuhotplug.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <asm/trace/fpu.h>
+@@ -76,9 +77,10 @@ static bool interrupted_user_mode(void)
+  */
+ bool irq_fpu_usable(void)
+ {
+-	return !in_interrupt() ||
+-		interrupted_user_mode() ||
+-		interrupted_kernel_fpu_idle();
++	return running_inband() &&
++		(!in_interrupt() ||
++			interrupted_user_mode() ||
++			interrupted_kernel_fpu_idle());
+ }
+ EXPORT_SYMBOL(irq_fpu_usable);
+ 
+@@ -123,11 +125,15 @@ EXPORT_SYMBOL(copy_fpregs_to_fpstate);
+ 
+ void kernel_fpu_begin_mask(unsigned int kfpu_mask)
+ {
++	unsigned long flags;
++
+ 	preempt_disable();
+ 
+ 	WARN_ON_FPU(!irq_fpu_usable());
+ 	WARN_ON_FPU(this_cpu_read(in_kernel_fpu));
+ 
++	flags = hard_cond_local_irq_save();
++
+ 	this_cpu_write(in_kernel_fpu, true);
+ 
+ 	if (!(current->flags & PF_KTHREAD) &&
+@@ -139,6 +145,7 @@ void kernel_fpu_begin_mask(unsigned int kfpu_mask)
+ 		 */
+ 		copy_fpregs_to_fpstate(&current->thread.fpu);
+ 	}
++
+ 	__cpu_invalidate_fpregs_state();
+ 
+ 	/* Put sane initial values into the control registers. */
+@@ -147,6 +154,8 @@ void kernel_fpu_begin_mask(unsigned int kfpu_mask)
+ 
+ 	if (unlikely(kfpu_mask & KFPU_387) && boot_cpu_has(X86_FEATURE_FPU))
+ 		asm volatile ("fninit");
++
++	hard_cond_local_irq_restore(flags);
+ }
+ EXPORT_SYMBOL_GPL(kernel_fpu_begin_mask);
+ 
+@@ -166,9 +175,11 @@ EXPORT_SYMBOL_GPL(kernel_fpu_end);
+  */
+ void fpu__save(struct fpu *fpu)
+ {
++	unsigned long flags;
++
+ 	WARN_ON_FPU(fpu != &current->thread.fpu);
+ 
+-	fpregs_lock();
++	flags = fpregs_lock();
+ 	trace_x86_fpu_before_save(fpu);
+ 
+ 	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
+@@ -178,7 +189,7 @@ void fpu__save(struct fpu *fpu)
+ 	}
+ 
+ 	trace_x86_fpu_after_save(fpu);
+-	fpregs_unlock();
++	fpregs_unlock(flags);
+ }
+ 
+ /*
+@@ -214,6 +225,7 @@ int fpu__copy(struct task_struct *dst, struct task_struct *src)
+ {
+ 	struct fpu *dst_fpu = &dst->thread.fpu;
+ 	struct fpu *src_fpu = &src->thread.fpu;
++	unsigned long flags;
+ 
+ 	dst_fpu->last_cpu = -1;
+ 
+@@ -236,14 +248,14 @@ int fpu__copy(struct task_struct *dst, struct task_struct *src)
+ 	 * ( The function 'fails' in the FNSAVE case, which destroys
+ 	 *   register contents so we have to load them back. )
+ 	 */
+-	fpregs_lock();
++	flags = fpregs_lock();
+ 	if (test_thread_flag(TIF_NEED_FPU_LOAD))
+ 		memcpy(&dst_fpu->state, &src_fpu->state, fpu_kernel_xstate_size);
+ 
+ 	else if (!copy_fpregs_to_fpstate(dst_fpu))
+ 		copy_kernel_to_fpregs(&dst_fpu->state);
+ 
+-	fpregs_unlock();
++	fpregs_unlock(flags);
+ 
+ 	set_tsk_thread_flag(dst, TIF_NEED_FPU_LOAD);
+ 
+@@ -321,7 +333,9 @@ void fpu__prepare_write(struct fpu *fpu)
+  */
+ void fpu__drop(struct fpu *fpu)
+ {
+-	preempt_disable();
++	unsigned long flags;
++
++	flags = hard_preempt_disable();
+ 
+ 	if (fpu == &current->thread.fpu) {
+ 		/* Ignore delayed exceptions from user space */
+@@ -333,7 +347,7 @@ void fpu__drop(struct fpu *fpu)
+ 
+ 	trace_x86_fpu_dropped(fpu);
+ 
+-	preempt_enable();
++	hard_preempt_enable(flags);
+ }
+ 
+ /*
+@@ -361,15 +375,19 @@ static inline void copy_init_fpstate_to_fpregs(u64 features_mask)
+  */
+ static void fpu__clear(struct fpu *fpu, bool user_only)
+ {
++	unsigned long flags;
++
+ 	WARN_ON_FPU(fpu != &current->thread.fpu);
+ 
+ 	if (!static_cpu_has(X86_FEATURE_FPU)) {
++		flags = hard_cond_local_irq_save();
+ 		fpu__drop(fpu);
+ 		fpu__initialize(fpu);
++		hard_cond_local_irq_restore(flags);
+ 		return;
+ 	}
+ 
+-	fpregs_lock();
++	flags = fpregs_lock();
+ 
+ 	if (user_only) {
+ 		if (!fpregs_state_valid(fpu, smp_processor_id()) &&
+@@ -382,7 +400,7 @@ static void fpu__clear(struct fpu *fpu, bool user_only)
+ 	}
+ 
+ 	fpregs_mark_activate();
+-	fpregs_unlock();
++	fpregs_unlock(flags);
+ }
+ 
+ void fpu__clear_user_states(struct fpu *fpu)
+@@ -400,10 +418,14 @@ void fpu__clear_all(struct fpu *fpu)
+  */
+ void switch_fpu_return(void)
+ {
++	unsigned long flags;
++
+ 	if (!static_cpu_has(X86_FEATURE_FPU))
+ 		return;
+ 
++	flags = hard_cond_local_irq_save();
+ 	__fpregs_load_activate();
++	hard_cond_local_irq_restore(flags);
+ }
+ EXPORT_SYMBOL_GPL(switch_fpu_return);
+ 
+@@ -503,3 +525,70 @@ int fpu__exception_code(struct fpu *fpu, int trap_nr)
+ 	 */
+ 	return 0;
+ }
++
++#ifdef CONFIG_DOVETAIL
++
++/*
++ * Holds the in-kernel fpu state when preempted by a task running on
++ * the out-of-band stage.
++ */
++static DEFINE_PER_CPU(struct fpu *, in_kernel_fpstate);
++
++static int fpu__init_kernel_fpstate(unsigned int cpu)
++{
++	struct fpu *fpu;
++
++	fpu = kzalloc(sizeof(*fpu) + fpu_kernel_xstate_size, GFP_KERNEL);
++	if (fpu == NULL)
++		return -ENOMEM;
++
++	this_cpu_write(in_kernel_fpstate, fpu);
++	fpstate_init(&fpu->state);
++
++	return 0;
++}
++
++static int fpu__drop_kernel_fpstate(unsigned int cpu)
++{
++	struct fpu *fpu = this_cpu_read(in_kernel_fpstate);
++
++	kfree(fpu);
++
++	return 0;
++}
++
++void fpu__suspend_inband(void)
++{
++	struct fpu *kfpu = this_cpu_read(in_kernel_fpstate);
++	struct task_struct *tsk = current;
++
++	if (kernel_fpu_disabled()) {
++		copy_fpregs_to_fpstate(kfpu);
++		__cpu_invalidate_fpregs_state();
++		oob_fpu_set_preempt(&tsk->thread.fpu);
++	}
++}
++
++void fpu__resume_inband(void)
++{
++	struct fpu *kfpu = this_cpu_read(in_kernel_fpstate);
++	struct task_struct *tsk = current;
++
++	if (oob_fpu_preempted(&tsk->thread.fpu)) {
++		copy_kernel_to_fpregs(&kfpu->state);
++		__cpu_invalidate_fpregs_state();
++		oob_fpu_clear_preempt(&tsk->thread.fpu);
++	} else if (!(tsk->flags & PF_KTHREAD) &&
++		test_thread_flag(TIF_NEED_FPU_LOAD))
++		switch_fpu_return();
++}
++
++static void __init fpu__init_dovetail(void)
++{
++	cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
++			"platform/x86/dovetail:online",
++			fpu__init_kernel_fpstate, fpu__drop_kernel_fpstate);
++}
++core_initcall(fpu__init_dovetail);
++
++#endif
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index b7b92cdf3..20d04a39b 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -61,11 +61,12 @@ static inline int save_fsave_header(struct task_struct *tsk, void __user *buf)
+ 		struct xregs_state *xsave = &tsk->thread.fpu.state.xsave;
+ 		struct user_i387_ia32_struct env;
+ 		struct _fpstate_32 __user *fp = buf;
++		unsigned long flags;
+ 
+-		fpregs_lock();
++		flags = fpregs_lock();
+ 		if (!test_thread_flag(TIF_NEED_FPU_LOAD))
+ 			copy_fxregs_to_kernel(&tsk->thread.fpu);
+-		fpregs_unlock();
++		fpregs_unlock(flags);
+ 
+ 		convert_from_fxsr(&env, tsk);
+ 
+@@ -165,6 +166,7 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ {
+ 	struct task_struct *tsk = current;
+ 	int ia32_fxstate = (buf != buf_fx);
++	unsigned long flags;
+ 	int ret;
+ 
+ 	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
+@@ -186,14 +188,14 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 	 * userland's stack frame which will likely succeed. If it does not,
+ 	 * resolve the fault in the user memory and try again.
+ 	 */
+-	fpregs_lock();
++	flags = fpregs_lock();
+ 	if (test_thread_flag(TIF_NEED_FPU_LOAD))
+ 		__fpregs_load_activate();
+ 
+ 	pagefault_disable();
+ 	ret = copy_fpregs_to_sigframe(buf_fx);
+ 	pagefault_enable();
+-	fpregs_unlock();
++	fpregs_unlock(flags);
+ 
+ 	if (ret) {
+ 		if (!fault_in_pages_writeable(buf_fx, fpu_user_xstate_size))
+@@ -286,6 +288,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	struct fpu *fpu = &tsk->thread.fpu;
+ 	struct user_i387_ia32_struct env;
+ 	u64 user_xfeatures = 0;
++	unsigned long flags;
+ 	int fx_only = 0;
+ 	int ret = 0;
+ 
+@@ -337,7 +340,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		 * going through the kernel buffer with the enabled pagefault
+ 		 * handler.
+ 		 */
+-		fpregs_lock();
++		flags = fpregs_lock();
+ 		pagefault_disable();
+ 		ret = copy_user_to_fpregs_zeroing(buf_fx, user_xfeatures, fx_only);
+ 		pagefault_enable();
+@@ -360,7 +363,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 				copy_kernel_to_xregs(&fpu->state.xsave,
+ 						     xfeatures_mask_supervisor());
+ 			fpregs_mark_activate();
+-			fpregs_unlock();
++			fpregs_unlock(flags);
+ 			return 0;
+ 		}
+ 
+@@ -382,7 +385,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		if (test_thread_flag(TIF_NEED_FPU_LOAD))
+ 			__cpu_invalidate_fpregs_state();
+ 
+-		fpregs_unlock();
++		fpregs_unlock(flags);
+ 	} else {
+ 		/*
+ 		 * For 32-bit frames with fxstate, copy the fxstate so it can
+@@ -400,7 +403,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	 * to be loaded again on return to userland (overriding last_cpu avoids
+ 	 * the optimisation).
+ 	 */
+-	fpregs_lock();
++	flags = fpregs_lock();
+ 
+ 	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
+ 
+@@ -413,7 +416,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		set_thread_flag(TIF_NEED_FPU_LOAD);
+ 	}
+ 	__fpu_invalidate_fpregs_state(fpu);
+-	fpregs_unlock();
++	fpregs_unlock(flags);
+ 
+ 	if (use_xsave() && !fx_only) {
+ 		u64 init_bv = xfeatures_mask_user() & ~user_xfeatures;
+@@ -425,7 +428,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		sanitize_restored_user_xstate(&fpu->state, envp, user_xfeatures,
+ 					      fx_only);
+ 
+-		fpregs_lock();
++		flags = fpregs_lock();
+ 		if (unlikely(init_bv))
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 
+@@ -446,7 +449,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		sanitize_restored_user_xstate(&fpu->state, envp, user_xfeatures,
+ 					      fx_only);
+ 
+-		fpregs_lock();
++		flags = fpregs_lock();
+ 		if (use_xsave()) {
+ 			u64 init_bv;
+ 
+@@ -460,14 +463,14 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		if (ret)
+ 			goto out;
+ 
+-		fpregs_lock();
++		flags = fpregs_lock();
+ 		ret = copy_kernel_to_fregs_err(&fpu->state.fsave);
+ 	}
+ 	if (!ret)
+ 		fpregs_mark_activate();
+ 	else
+ 		fpregs_deactivate(fpu);
+-	fpregs_unlock();
++	fpregs_unlock(flags);
+ 
+ out:
+ 	if (ret)
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index 1cb8c35f5..65d61712f 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -537,8 +537,15 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 	struct thread_struct *next = &next_p->thread;
+ 	int cpu = smp_processor_id();
+ 
++	/*
++	 * Dovetail: Switching context on the out-of-band stage is
++	 * legit, and we may have preempted an in-band (soft)irq
++	 * handler earlier. Since oob handlers never switch stack,
++	 * make sure to restrict the following test to in-band
++	 * callers.
++	 */
+ 	WARN_ON_ONCE(IS_ENABLED(CONFIG_DEBUG_ENTRY) &&
+-		     this_cpu_read(irq_count) != -1);
++		     running_inband() && this_cpu_read(irq_count) != -1);
+ 
+ 	WARN_ON_ONCE(dovetail_debug() && !hard_irqs_disabled());
+ 
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index 2aa41d682..dc191c2eb 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -1096,23 +1096,27 @@ static void fetch_register_operand(struct operand *op)
+ 	}
+ }
+ 
+-static void emulator_get_fpu(void)
++static unsigned long emulator_get_fpu(void)
+ {
+-	fpregs_lock();
++	unsigned long flags = fpregs_lock();
+ 
+ 	fpregs_assert_state_consistent();
+ 	if (test_thread_flag(TIF_NEED_FPU_LOAD))
+ 		switch_fpu_return();
++
++	return flags;
+ }
+ 
+-static void emulator_put_fpu(void)
++static void emulator_put_fpu(unsigned long flags)
+ {
+-	fpregs_unlock();
++	fpregs_unlock(flags);
+ }
+ 
+ static void read_sse_reg(sse128_t *data, int reg)
+ {
+-	emulator_get_fpu();
++	unsigned long flags;
++
++	flags = emulator_get_fpu();
+ 	switch (reg) {
+ 	case 0: asm("movdqa %%xmm0, %0" : "=m"(*data)); break;
+ 	case 1: asm("movdqa %%xmm1, %0" : "=m"(*data)); break;
+@@ -1134,12 +1138,14 @@ static void read_sse_reg(sse128_t *data, int reg)
+ #endif
+ 	default: BUG();
+ 	}
+-	emulator_put_fpu();
++	emulator_put_fpu(flags);
+ }
+ 
+ static void write_sse_reg(sse128_t *data, int reg)
+ {
+-	emulator_get_fpu();
++	unsigned long flags;
++
++	flags = emulator_get_fpu();
+ 	switch (reg) {
+ 	case 0: asm("movdqa %0, %%xmm0" : : "m"(*data)); break;
+ 	case 1: asm("movdqa %0, %%xmm1" : : "m"(*data)); break;
+@@ -1161,12 +1167,14 @@ static void write_sse_reg(sse128_t *data, int reg)
+ #endif
+ 	default: BUG();
+ 	}
+-	emulator_put_fpu();
++	emulator_put_fpu(flags);
+ }
+ 
+ static void read_mmx_reg(u64 *data, int reg)
+ {
+-	emulator_get_fpu();
++	unsigned long flags;
++
++	flags = emulator_get_fpu();
+ 	switch (reg) {
+ 	case 0: asm("movq %%mm0, %0" : "=m"(*data)); break;
+ 	case 1: asm("movq %%mm1, %0" : "=m"(*data)); break;
+@@ -1178,12 +1186,14 @@ static void read_mmx_reg(u64 *data, int reg)
+ 	case 7: asm("movq %%mm7, %0" : "=m"(*data)); break;
+ 	default: BUG();
+ 	}
+-	emulator_put_fpu();
++	emulator_put_fpu(flags);
+ }
+ 
+ static void write_mmx_reg(u64 *data, int reg)
+ {
+-	emulator_get_fpu();
++	unsigned long flags;
++
++	flags = emulator_get_fpu();
+ 	switch (reg) {
+ 	case 0: asm("movq %0, %%mm0" : : "m"(*data)); break;
+ 	case 1: asm("movq %0, %%mm1" : : "m"(*data)); break;
+@@ -1195,30 +1205,33 @@ static void write_mmx_reg(u64 *data, int reg)
+ 	case 7: asm("movq %0, %%mm7" : : "m"(*data)); break;
+ 	default: BUG();
+ 	}
+-	emulator_put_fpu();
++	emulator_put_fpu(flags);
+ }
+ 
+ static int em_fninit(struct x86_emulate_ctxt *ctxt)
+ {
++	unsigned long flags;
++
+ 	if (ctxt->ops->get_cr(ctxt, 0) & (X86_CR0_TS | X86_CR0_EM))
+ 		return emulate_nm(ctxt);
+ 
+-	emulator_get_fpu();
++	flags = emulator_get_fpu();
+ 	asm volatile("fninit");
+-	emulator_put_fpu();
++	emulator_put_fpu(flags);
+ 	return X86EMUL_CONTINUE;
+ }
+ 
+ static int em_fnstcw(struct x86_emulate_ctxt *ctxt)
+ {
++	unsigned long flags;
+ 	u16 fcw;
+ 
+ 	if (ctxt->ops->get_cr(ctxt, 0) & (X86_CR0_TS | X86_CR0_EM))
+ 		return emulate_nm(ctxt);
+ 
+-	emulator_get_fpu();
++	flags = emulator_get_fpu();
+ 	asm volatile("fnstcw %0": "+m"(fcw));
+-	emulator_put_fpu();
++	emulator_put_fpu(flags);
+ 
+ 	ctxt->dst.val = fcw;
+ 
+@@ -1227,14 +1240,15 @@ static int em_fnstcw(struct x86_emulate_ctxt *ctxt)
+ 
+ static int em_fnstsw(struct x86_emulate_ctxt *ctxt)
+ {
++	unsigned long flags;
+ 	u16 fsw;
+ 
+ 	if (ctxt->ops->get_cr(ctxt, 0) & (X86_CR0_TS | X86_CR0_EM))
+ 		return emulate_nm(ctxt);
+ 
+-	emulator_get_fpu();
++	flags = emulator_get_fpu();
+ 	asm volatile("fnstsw %0": "+m"(fsw));
+-	emulator_put_fpu();
++	emulator_put_fpu(flags);
+ 
+ 	ctxt->dst.val = fsw;
+ 
+@@ -4138,17 +4152,18 @@ static inline size_t fxstate_size(struct x86_emulate_ctxt *ctxt)
+ static int em_fxsave(struct x86_emulate_ctxt *ctxt)
+ {
+ 	struct fxregs_state fx_state;
++	unsigned long flags;
+ 	int rc;
+ 
+ 	rc = check_fxsr(ctxt);
+ 	if (rc != X86EMUL_CONTINUE)
+ 		return rc;
+ 
+-	emulator_get_fpu();
++	flags = emulator_get_fpu();
+ 
+ 	rc = asm_safe("fxsave %[fx]", , [fx] "+m"(fx_state));
+ 
+-	emulator_put_fpu();
++	emulator_put_fpu(flags);
+ 
+ 	if (rc != X86EMUL_CONTINUE)
+ 		return rc;
+@@ -4180,6 +4195,7 @@ static noinline int fxregs_fixup(struct fxregs_state *fx_state,
+ static int em_fxrstor(struct x86_emulate_ctxt *ctxt)
+ {
+ 	struct fxregs_state fx_state;
++	unsigned long flags;
+ 	int rc;
+ 	size_t size;
+ 
+@@ -4192,7 +4208,7 @@ static int em_fxrstor(struct x86_emulate_ctxt *ctxt)
+ 	if (rc != X86EMUL_CONTINUE)
+ 		return rc;
+ 
+-	emulator_get_fpu();
++	flags = emulator_get_fpu();
+ 
+ 	if (size < __fxstate_size(16)) {
+ 		rc = fxregs_fixup(&fx_state, size);
+@@ -4209,7 +4225,7 @@ static int em_fxrstor(struct x86_emulate_ctxt *ctxt)
+ 		rc = asm_safe("fxrstor %[fx]", : [fx] "m"(fx_state));
+ 
+ out:
+-	emulator_put_fpu();
++	emulator_put_fpu(flags);
+ 
+ 	return rc;
+ }
+@@ -5454,11 +5470,12 @@ static bool string_insn_completed(struct x86_emulate_ctxt *ctxt)
+ 
+ static int flush_pending_x87_faults(struct x86_emulate_ctxt *ctxt)
+ {
++	unsigned long flags;
+ 	int rc;
+ 
+-	emulator_get_fpu();
++	flags = emulator_get_fpu();
+ 	rc = asm_safe("fwait");
+-	emulator_put_fpu();
++	emulator_put_fpu(flags);
+ 
+ 	if (unlikely(rc != X86EMUL_CONTINUE))
+ 		return emulate_exception(ctxt, MF_VECTOR, 0, false);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 5f4f855bb..8542c83a4 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -9372,7 +9372,9 @@ static void kvm_save_current_fpu(struct fpu *fpu)
+ /* Swap (qemu) user FPU context for the guest FPU context. */
+ static void kvm_load_guest_fpu(struct kvm_vcpu *vcpu)
+ {
+-	fpregs_lock();
++	unsigned long flags;
++
++	flags = fpregs_lock();
+ 
+ 	kvm_save_current_fpu(vcpu->arch.user_fpu);
+ 
+@@ -9381,7 +9383,7 @@ static void kvm_load_guest_fpu(struct kvm_vcpu *vcpu)
+ 				~XFEATURE_MASK_PKRU);
+ 
+ 	fpregs_mark_activate();
+-	fpregs_unlock();
++	fpregs_unlock(flags);
+ 
+ 	trace_kvm_fpu(1);
+ }
+@@ -9389,14 +9391,16 @@ static void kvm_load_guest_fpu(struct kvm_vcpu *vcpu)
+ /* When vcpu_run ends, restore user space FPU context. */
+ static void kvm_put_guest_fpu(struct kvm_vcpu *vcpu)
+ {
+-	fpregs_lock();
++	unsigned long flags;
++
++	flags = fpregs_lock();
+ 
+ 	kvm_save_current_fpu(vcpu->arch.guest_fpu);
+ 
+ 	copy_kernel_to_fpregs(&vcpu->arch.user_fpu->state);
+ 
+ 	fpregs_mark_activate();
+-	fpregs_unlock();
++	fpregs_unlock(flags);
+ 
+ 	++vcpu->stat.fpu_reload;
+ 	trace_kvm_fpu(0);
+-- 
+2.38.1
+

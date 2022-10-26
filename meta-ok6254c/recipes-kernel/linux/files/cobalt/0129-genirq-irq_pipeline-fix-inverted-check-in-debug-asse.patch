@@ -1,0 +1,39 @@
+From 80b4d46384a7032dfdab1f5a70dcc261fd985f37 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 27 Jul 2021 18:32:15 +0200
+Subject: [PATCH 129/179] genirq: irq_pipeline: fix inverted check in debug
+ assertion
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ kernel/irq/pipeline.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/irq/pipeline.c b/kernel/irq/pipeline.c
+index 19eaad236..abc9f51c6 100644
+--- a/kernel/irq/pipeline.c
++++ b/kernel/irq/pipeline.c
+@@ -1076,15 +1076,15 @@ int generic_pipeline_irq(unsigned int irq, struct pt_regs *regs)
+ 			pr_err("IRQ pipeline: interrupts enabled on entry (IRQ%u)\n",
+ 			       irq);
+ 		}
++
+ 		/*
+ 		 * Running with the oob stage stalled implies hardirqs
+ 		 * off.  For this reason, if the oob stage is stalled
+-		 * on pipeline entry but we still receive an interrupt
+-		 * from the hardware, something is badly broken in our
+-		 * interrupt state. Try fixing up, but without great
+-		 * hopes.
++		 * when we receive an interrupt from the hardware,
++		 * something is badly broken in our interrupt
++		 * state. Try fixing up, but without great hopes.
+ 		 */
+-		if (on_pipeline_entry() && test_oob_stall()) {
++		if (!on_pipeline_entry() && test_oob_stall()) {
+ 			pr_err("IRQ pipeline: out-of-band stage stalled on IRQ entry\n");
+ 			unstall_oob();
+ 		}
+-- 
+2.38.1
+

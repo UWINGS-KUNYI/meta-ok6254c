@@ -1,0 +1,32 @@
+From b1d7f4500c2c6e7b18ffba0082b482a7a69d3876 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Fri, 8 Jul 2022 10:24:43 +0200
+Subject: [PATCH 167/179] x86: dovetail: remove redundant mark entry
+
+handle_invalid_op() already marks the fault entry upon UD trap, no
+need to do this from the exception trampoline code calling it.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/x86/kernel/traps.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index e8f0208d6..c9c23ec47 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -294,11 +294,9 @@ DEFINE_IDTENTRY_RAW(exc_invalid_op)
+ 		return;
+ 
+ 	state = irqentry_enter(regs);
+-	mark_trap_entry(X86_TRAP_UD, regs);
+ 	instrumentation_begin();
+ 	handle_invalid_op(regs);
+ 	instrumentation_end();
+-	mark_trap_exit(X86_TRAP_UD, regs);
+ 	irqentry_exit(regs, state);
+ }
+ 
+-- 
+2.38.1
+

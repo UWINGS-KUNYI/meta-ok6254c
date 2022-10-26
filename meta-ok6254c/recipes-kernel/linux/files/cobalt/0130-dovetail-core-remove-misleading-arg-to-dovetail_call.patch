@@ -1,0 +1,81 @@
+From f7e9f8399f4a4fcfd84f5cd740c186a004baf48b Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Mon, 2 Aug 2021 18:42:20 +0200
+Subject: [PATCH 130/179] dovetail: core: remove misleading arg to
+ dovetail_call_mayday()
+
+A task always calls the mayday handler for itself by definition
+(although such call may be scheduled by any task).
+
+Passing the thread information pointer to dovetail_call_mayday() is
+misleading, we don't get to choose which task the mayday event is
+applicable to when running the handler, it has to be 'current'.
+
+Enforce this invariant by using current_thread_info() unconditionally
+in dovetail_call_mayday(), removing the corresponding argument.
+
+Bonus: incidentally, this change also fixes an issue in the ARM entry
+code which was wrongly calling dovetail_call_mayday() without passing
+the thread_info argument (r0 <- @regs).
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ include/linux/dovetail.h | 3 +--
+ kernel/dovetail.c        | 5 +++--
+ kernel/irq/pipeline.c    | 2 +-
+ 3 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/dovetail.h b/include/linux/dovetail.h
+index c73ac644e..2eed47788 100644
+--- a/include/linux/dovetail.h
++++ b/include/linux/dovetail.h
+@@ -195,8 +195,7 @@ struct oob_mm_state *dovetail_mm_state(void)
+ 	return &current->mm->oob_state;
+ }
+ 
+-void dovetail_call_mayday(struct thread_info *ti,
+-			  struct pt_regs *regs);
++void dovetail_call_mayday(struct pt_regs *regs);
+ 
+ static inline void dovetail_send_mayday(struct task_struct *castaway)
+ {
+diff --git a/kernel/dovetail.c b/kernel/dovetail.c
+index 013d6ed16..13c140160 100644
+--- a/kernel/dovetail.c
++++ b/kernel/dovetail.c
+@@ -86,8 +86,9 @@ void call_mayday(struct thread_info *ti, struct pt_regs *regs)
+ 	handle_oob_mayday(regs);
+ }
+ 
+-void dovetail_call_mayday(struct thread_info *ti, struct pt_regs *regs)
++void dovetail_call_mayday(struct pt_regs *regs)
+ {
++	struct thread_info *ti = current_thread_info();
+ 	unsigned long flags;
+ 
+ 	flags = hard_local_irq_save();
+@@ -207,7 +208,7 @@ int pipeline_syscall(unsigned int nr, struct pt_regs *regs)
+ 		local_flags = READ_ONCE(ti_local_flags(ti));
+ 		if (local_flags & _TLF_OOB) {
+ 			if (test_ti_thread_flag(ti, TIF_MAYDAY))
+-				dovetail_call_mayday(ti, regs);
++				dovetail_call_mayday(regs);
+ 			return 1; /* don't pass down, no tail work. */
+ 		} else {
+ 			WARN_ON_ONCE(dovetail_debug() && irqs_disabled());
+diff --git a/kernel/irq/pipeline.c b/kernel/irq/pipeline.c
+index abc9f51c6..eefddd773 100644
+--- a/kernel/irq/pipeline.c
++++ b/kernel/irq/pipeline.c
+@@ -1163,7 +1163,7 @@ int handle_irq_pipelined_finish(struct irq_stage_data *prevd,
+ 	 * then maybe clear over test_and_clear.
+ 	 */
+ 	if (user_mode(regs) && test_thread_flag(TIF_MAYDAY))
+-		dovetail_call_mayday(current_thread_info(), regs);
++		dovetail_call_mayday(regs);
+ #endif
+ 
+ 	return running_inband() && !irqs_disabled();
+-- 
+2.38.1
+

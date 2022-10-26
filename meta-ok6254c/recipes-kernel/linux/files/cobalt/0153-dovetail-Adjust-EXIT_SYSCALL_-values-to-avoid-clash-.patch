@@ -1,0 +1,39 @@
+From 25b256d865e1e9e37b085bb7ba26ef692e953aac Mon Sep 17 00:00:00 2001
+From: Jan Kiszka <jan.kiszka@siemens.com>
+Date: Fri, 12 Nov 2021 09:34:09 +0100
+Subject: [PATCH 153/179] dovetail: Adjust EXIT_SYSCALL_* values to avoid clash
+ with seccomp
+
+__secure_computing, called by syscall_trace_enter, returns -1 when a
+call should be skipped. We must avoid that this is interpreted as
+EXIT_SYSCALL_OOB in the dovetail case.
+
+Fixes, e.g., crashes of Chrome in sandbox mode.
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+---
+ include/linux/entry-common.h | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/entry-common.h b/include/linux/entry-common.h
+index ac53de571..d9a0e6a91 100644
+--- a/include/linux/entry-common.h
++++ b/include/linux/entry-common.h
+@@ -74,10 +74,11 @@
+ 
+ /*
+  * Status codes of syscall entry when Dovetail is enabled. Must not
+- * conflict with valid syscall numbers.
++ * conflict with valid syscall numbers. And with -1 which seccomp uses
++ * to skip an syscall.
+  */
+-#define EXIT_SYSCALL_OOB	(-1)
+-#define EXIT_SYSCALL_TAIL	(-2)
++#define EXIT_SYSCALL_OOB	(-2)
++#define EXIT_SYSCALL_TAIL	(-3)
+ 
+ /**
+  * arch_check_user_regs - Architecture specific sanity check for user mode regs
+-- 
+2.38.1
+

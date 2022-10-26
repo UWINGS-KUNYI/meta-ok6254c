@@ -1,0 +1,52 @@
+From 7add36b558cbcaa8da4640d2f191c10f480f3a44 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 7 Jul 2020 18:39:36 +0200
+Subject: [PATCH 066/179] arm64: dovetail: route syscalls
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm64/kernel/syscall.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/kernel/syscall.c b/arch/arm64/kernel/syscall.c
+index d9a7677ce..78db39f10 100644
+--- a/arch/arm64/kernel/syscall.c
++++ b/arch/arm64/kernel/syscall.c
+@@ -95,6 +95,7 @@ static void el0_svc_common(struct pt_regs *regs, int scno, int sc_nr,
+ 			   const syscall_fn_t syscall_table[])
+ {
+ 	unsigned long flags = current_thread_info()->flags;
++	int ret;
+ 
+ 	regs->orig_x0 = regs->regs[0];
+ 	regs->syscallno = scno;
+@@ -119,7 +120,17 @@ static void el0_svc_common(struct pt_regs *regs, int scno, int sc_nr,
+ 
+ 	cortex_a76_erratum_1463225_svc_handler();
+ 	local_daif_restore(DAIF_PROCCTX);
+-	unstall_inband();
++	if (running_inband()) {
++		unstall_inband();
++		user_exit();
++	}
++
++	ret = pipeline_syscall(scno, regs);
++	if (ret > 0)
++		return;
++
++	if (ret < 0)
++		goto tail_work;
+ 
+ 	if (system_supports_mte() && (flags & _TIF_MTE_ASYNC_FAULT)) {
+ 		/*
+@@ -161,6 +172,7 @@ static void el0_svc_common(struct pt_regs *regs, int scno, int sc_nr,
+ 	 * check again. However, if we were tracing entry, then we always trace
+ 	 * exit regardless, as the old entry assembly did.
+ 	 */
++tail_work:
+ 	if (!has_syscall_work(flags) && !IS_ENABLED(CONFIG_DEBUG_RSEQ)) {
+ 		local_daif_mask();
+ 		stall_inband();
+-- 
+2.38.1
+

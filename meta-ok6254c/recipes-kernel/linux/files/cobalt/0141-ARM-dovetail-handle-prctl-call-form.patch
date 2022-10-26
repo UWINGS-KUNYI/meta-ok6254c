@@ -1,0 +1,35 @@
+From f884e0c4e6ec7d9d1e09911d9184a4663bb05947 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Mon, 1 Nov 2021 11:33:35 +0100
+Subject: [PATCH 141/179] ARM: dovetail: handle prctl() call form
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm/kernel/entry-common.S | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/arm/kernel/entry-common.S b/arch/arm/kernel/entry-common.S
+index 8112ebb89..c2a090f68 100644
+--- a/arch/arm/kernel/entry-common.S
++++ b/arch/arm/kernel/entry-common.S
+@@ -291,6 +291,8 @@ local_restart:
+ 	b	fastcall_try
+ 1:
+ #endif	
++	cmp	scno, #__NR_prctl
++	beq	fastcall_try
+ 	ldr	r0, =#__OOB_SYSCALL_BIT
+ 	ands	r0, scno, r0
+ 	beq	slow_path
+@@ -314,6 +316,8 @@ fastcall_exit_check:
+ slow_path:
+ 	tst	r10, #_TLF_DOVETAIL
+ 	bne	pipeline_syscall
++	cmp	scno, #__NR_prctl
++	beq	pipeline_syscall
+ 	ands	r0, scno, r0
+ 	beq	root_syscall
+ pipeline_syscall:
+-- 
+2.38.1
+

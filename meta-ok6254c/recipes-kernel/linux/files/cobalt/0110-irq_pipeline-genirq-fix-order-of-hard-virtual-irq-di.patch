@@ -1,0 +1,52 @@
+From 2bc00a983cc91acb372f8de7ba7577e8b7b65c27 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Mon, 7 Jun 2021 18:41:41 +0200
+Subject: [PATCH 110/179] irq_pipeline: genirq: fix order of hard+virtual irq
+ disable sequence
+
+The way local_irq_disable_full() works may cause interrupt events to
+lag in the interrupt log inadvertently if the code path does not
+synchronize such log afterwards. As a result, some interrupts may not
+get played when they should, causing breakage.
+
+Since calling inband_irq_disable() with hard irqs off is deemed ok
+(unlike with inband_irq_enable()), invert the two operations so that
+hard irqs are disabled before the in-band stage is stalled, preventing
+any interrupt to be logged in between.
+
+See https://xenomai.org/pipermail/xenomai/2021-June/045476.html.
+
+This fixes this issue:
+https://xenomai.org/pipermail/xenomai/2021-May/045071.html
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+Reported-by: Florian Bezdeka <florian.bezdeka@siemens.com>
+---
+ include/linux/irqflags.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/irqflags.h b/include/linux/irqflags.h
+index 8663f19cc..051c72751 100644
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@ -242,14 +242,14 @@ do {						\
+ 
+ #define local_irq_disable_full()		\
+ 	do {					\
+-		local_irq_disable();		\
+ 		hard_local_irq_disable();	\
++		local_irq_disable();		\
+ 	} while (0)
+ 
+ #define local_irq_save_full(__flags)		\
+   	do {					\
+-		local_irq_save(__flags);	\
+ 		hard_local_irq_disable();	\
++		local_irq_save(__flags);	\
+ 	} while (0)
+ 
+ #define local_irq_restore_full(__flags)			\
+-- 
+2.38.1
+

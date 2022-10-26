@@ -1,0 +1,6579 @@
+From ffedfa9c3cd9694fdfaa12f5494bd4b3398ceb70 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Wed, 20 Jul 2016 15:06:15 +0200
+Subject: [PATCH 021/179] genirq: irq_pipeline: add IRQ pipeline core
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/cpuidle/cpuidle.c              |   18 +
+ drivers/cpuidle/poll_state.c           |    2 +-
+ fs/exec.c                              |    1 +
+ include/asm-generic/atomic.h           |   12 +-
+ include/asm-generic/cmpxchg-local.h    |    8 +-
+ include/asm-generic/cmpxchg.h          |   16 +-
+ include/asm-generic/irq_pipeline.h     |  109 ++
+ include/asm-generic/percpu.h           |   24 +-
+ include/dovetail/irq.h                 |   11 +
+ include/linux/context_tracking_state.h |    2 +-
+ include/linux/hardirq.h                |   18 +
+ include/linux/interrupt.h              |   29 +-
+ include/linux/irq.h                    |   50 +-
+ include/linux/irq_pipeline.h           |  135 ++
+ include/linux/irqdesc.h                |   25 +-
+ include/linux/irqflags.h               |   33 +
+ include/linux/irqstage.h               |  389 ++++++
+ include/linux/kernel.h                 |    8 +-
+ include/linux/lockdep.h                |   39 +-
+ include/linux/preempt.h                |   57 +-
+ include/linux/sched.h                  |    4 +
+ include/linux/smp.h                    |   15 +
+ include/linux/spinlock.h               |   98 +-
+ include/linux/spinlock_api_up.h        |   18 +
+ include/linux/spinlock_pipeline.h      |  361 +++++
+ include/linux/spinlock_types.h         |  146 +++
+ include/linux/thread_info.h            |   21 +-
+ include/trace/events/irq.h             |   42 +
+ init/Makefile                          |    2 +-
+ init/main.c                            |    7 +-
+ kernel/irq/Kconfig                     |   13 +
+ kernel/irq/Makefile                    |    1 +
+ kernel/irq/chip.c                      |  269 +++-
+ kernel/irq/cpuhotplug.c                |    5 +
+ kernel/irq/debug.h                     |    2 +
+ kernel/irq/dummychip.c                 |    4 +-
+ kernel/irq/handle.c                    |    9 +-
+ kernel/irq/internals.h                 |    2 +
+ kernel/irq/irqdesc.c                   |    9 +-
+ kernel/irq/manage.c                    |   89 +-
+ kernel/irq/msi.c                       |    3 +
+ kernel/irq/pipeline.c                  | 1662 ++++++++++++++++++++++++
+ kernel/irq/resend.c                    |    8 +-
+ kernel/irq/settings.h                  |   34 +
+ kernel/irq_work.c                      |    9 +-
+ kernel/kthread.c                       |    1 +
+ kernel/locking/Makefile                |    1 +
+ kernel/locking/lockdep.c               |  101 +-
+ kernel/locking/lockdep_internals.h     |    4 +-
+ kernel/locking/pipeline.c              |  226 ++++
+ kernel/locking/spinlock_debug.c        |    3 +
+ kernel/panic.c                         |   26 +-
+ kernel/power/hibernate.c               |    3 +
+ kernel/printk/printk.c                 |    1 +
+ kernel/rcu/tree.c                      |   10 +
+ kernel/sched/core.c                    |   34 +-
+ kernel/sched/idle.c                    |   22 +-
+ kernel/sched/sched.h                   |    1 +
+ kernel/sched/wait.c                    |    2 +
+ lib/Kconfig.debug                      |   31 +
+ lib/atomic64.c                         |   24 +-
+ lib/dump_stack.c                       |   36 +-
+ lib/smp_processor_id.c                 |    4 +
+ mm/mprotect.c                          |    4 +-
+ scripts/mkcompile_h                    |    6 +-
+ 65 files changed, 4118 insertions(+), 241 deletions(-)
+ create mode 100644 include/asm-generic/irq_pipeline.h
+ create mode 100644 include/dovetail/irq.h
+ create mode 100644 include/linux/irq_pipeline.h
+ create mode 100644 include/linux/irqstage.h
+ create mode 100644 include/linux/spinlock_pipeline.h
+ create mode 100644 kernel/irq/pipeline.c
+ create mode 100644 kernel/locking/pipeline.c
+
+diff --git a/drivers/cpuidle/cpuidle.c b/drivers/cpuidle/cpuidle.c
+index 83af15f77..11003d971 100644
+--- a/drivers/cpuidle/cpuidle.c
++++ b/drivers/cpuidle/cpuidle.c
+@@ -17,6 +17,7 @@
+ #include <linux/pm_qos.h>
+ #include <linux/cpu.h>
+ #include <linux/cpuidle.h>
++#include <linux/irq_pipeline.h>
+ #include <linux/ktime.h>
+ #include <linux/hrtimer.h>
+ #include <linux/module.h>
+@@ -206,6 +207,22 @@ int cpuidle_enter_state(struct cpuidle_device *dev, struct cpuidle_driver *drv,
+ 	bool broadcast = !!(target_state->flags & CPUIDLE_FLAG_TIMER_STOP);
+ 	ktime_t time_start, time_end;
+ 
++	/*
++	 * A companion core running on the oob stage of the IRQ
++	 * pipeline may deny switching to a deeper C-state. If so,
++	 * call the default idle routine instead. If the core cannot
++	 * bear with the latency induced by the default idling
++	 * operation, then CPUIDLE is not usable and should be
++	 * disabled at build time. The in-band stage is currently
++	 * stalled, hard irqs are on. irq_cpuidle_enter() leaves us
++	 * stalled but returns with hard irqs off so that no event may
++	 * sneak in until we actually go idle.
++	 */
++	if (!irq_cpuidle_enter(dev, target_state)) {
++		default_idle_call();
++		return -EBUSY;
++	}
++
+ 	/*
+ 	 * Tell the time framework to switch to a broadcast timer because our
+ 	 * local timer will be shut down.  If a local timer is used from another
+@@ -235,6 +252,7 @@ int cpuidle_enter_state(struct cpuidle_device *dev, struct cpuidle_driver *drv,
+ 	if (!(target_state->flags & CPUIDLE_FLAG_RCU_IDLE))
+ 		rcu_idle_enter();
+ 	entered_state = target_state->enter(dev, drv, index);
++	hard_cond_local_irq_enable();
+ 	if (!(target_state->flags & CPUIDLE_FLAG_RCU_IDLE))
+ 		rcu_idle_exit();
+ 	start_critical_timings();
+diff --git a/drivers/cpuidle/poll_state.c b/drivers/cpuidle/poll_state.c
+index f7e83613a..1245138d7 100644
+--- a/drivers/cpuidle/poll_state.c
++++ b/drivers/cpuidle/poll_state.c
+@@ -17,7 +17,7 @@ static int __cpuidle poll_idle(struct cpuidle_device *dev,
+ 
+ 	dev->poll_time_limit = false;
+ 
+-	local_irq_enable();
++	local_irq_enable_full();
+ 	if (!current_set_polling_and_test()) {
+ 		unsigned int loop_count = 0;
+ 		u64 limit;
+diff --git a/fs/exec.c b/fs/exec.c
+index b56bc4b40..126b80114 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -34,6 +34,7 @@
+ #include <linux/swap.h>
+ #include <linux/string.h>
+ #include <linux/init.h>
++#include <linux/irq_pipeline.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/coredump.h>
+ #include <linux/sched/signal.h>
+diff --git a/include/asm-generic/atomic.h b/include/asm-generic/atomic.h
+index 11f96f40f..34100ba98 100644
+--- a/include/asm-generic/atomic.h
++++ b/include/asm-generic/atomic.h
+@@ -76,9 +76,9 @@ static inline void atomic_##op(int i, atomic_t *v)			\
+ {									\
+ 	unsigned long flags;						\
+ 									\
+-	raw_local_irq_save(flags);					\
++	flags = hard_local_irq_save();					\
+ 	v->counter = v->counter c_op i;					\
+-	raw_local_irq_restore(flags);					\
++	hard_local_irq_restore(flags);					\
+ }
+ 
+ #define ATOMIC_OP_RETURN(op, c_op)					\
+@@ -87,9 +87,9 @@ static inline int atomic_##op##_return(int i, atomic_t *v)		\
+ 	unsigned long flags;						\
+ 	int ret;							\
+ 									\
+-	raw_local_irq_save(flags);					\
++	flags = hard_local_irq_save();					\
+ 	ret = (v->counter = v->counter c_op i);				\
+-	raw_local_irq_restore(flags);					\
++	hard_local_irq_restore(flags);					\
+ 									\
+ 	return ret;							\
+ }
+@@ -100,10 +100,10 @@ static inline int atomic_fetch_##op(int i, atomic_t *v)			\
+ 	unsigned long flags;						\
+ 	int ret;							\
+ 									\
+-	raw_local_irq_save(flags);					\
++	flags = hard_local_irq_save();					\
+ 	ret = v->counter;						\
+ 	v->counter = v->counter c_op i;					\
+-	raw_local_irq_restore(flags);					\
++	hard_local_irq_restore(flags);					\
+ 									\
+ 	return ret;							\
+ }
+diff --git a/include/asm-generic/cmpxchg-local.h b/include/asm-generic/cmpxchg-local.h
+index f17f14f84..67d712ff0 100644
+--- a/include/asm-generic/cmpxchg-local.h
++++ b/include/asm-generic/cmpxchg-local.h
+@@ -23,7 +23,7 @@ static inline unsigned long __cmpxchg_local_generic(volatile void *ptr,
+ 	if (size == 8 && sizeof(unsigned long) != 8)
+ 		wrong_size_cmpxchg(ptr);
+ 
+-	raw_local_irq_save(flags);
++	flags = hard_local_irq_save();
+ 	switch (size) {
+ 	case 1: prev = *(u8 *)ptr;
+ 		if (prev == old)
+@@ -44,7 +44,7 @@ static inline unsigned long __cmpxchg_local_generic(volatile void *ptr,
+ 	default:
+ 		wrong_size_cmpxchg(ptr);
+ 	}
+-	raw_local_irq_restore(flags);
++	hard_local_irq_restore(flags);
+ 	return prev;
+ }
+ 
+@@ -57,11 +57,11 @@ static inline u64 __cmpxchg64_local_generic(volatile void *ptr,
+ 	u64 prev;
+ 	unsigned long flags;
+ 
+-	raw_local_irq_save(flags);
++	flags = hard_local_irq_save();
+ 	prev = *(u64 *)ptr;
+ 	if (prev == old)
+ 		*(u64 *)ptr = new;
+-	raw_local_irq_restore(flags);
++	hard_local_irq_restore(flags);
+ 	return prev;
+ }
+ 
+diff --git a/include/asm-generic/cmpxchg.h b/include/asm-generic/cmpxchg.h
+index 9a24510cd..475206bd5 100644
+--- a/include/asm-generic/cmpxchg.h
++++ b/include/asm-generic/cmpxchg.h
+@@ -32,10 +32,10 @@ unsigned long __xchg(unsigned long x, volatile void *ptr, int size)
+ #ifdef __xchg_u8
+ 		return __xchg_u8(x, ptr);
+ #else
+-		local_irq_save(flags);
++		flags = hard_local_irq_save();
+ 		ret = *(volatile u8 *)ptr;
+ 		*(volatile u8 *)ptr = x;
+-		local_irq_restore(flags);
++		hard_local_irq_restore(flags);
+ 		return ret;
+ #endif /* __xchg_u8 */
+ 
+@@ -43,10 +43,10 @@ unsigned long __xchg(unsigned long x, volatile void *ptr, int size)
+ #ifdef __xchg_u16
+ 		return __xchg_u16(x, ptr);
+ #else
+-		local_irq_save(flags);
++		flags = hard_local_irq_save();
+ 		ret = *(volatile u16 *)ptr;
+ 		*(volatile u16 *)ptr = x;
+-		local_irq_restore(flags);
++		hard_local_irq_restore(flags);
+ 		return ret;
+ #endif /* __xchg_u16 */
+ 
+@@ -54,10 +54,10 @@ unsigned long __xchg(unsigned long x, volatile void *ptr, int size)
+ #ifdef __xchg_u32
+ 		return __xchg_u32(x, ptr);
+ #else
+-		local_irq_save(flags);
++		flags = hard_local_irq_save();
+ 		ret = *(volatile u32 *)ptr;
+ 		*(volatile u32 *)ptr = x;
+-		local_irq_restore(flags);
++		hard_local_irq_restore(flags);
+ 		return ret;
+ #endif /* __xchg_u32 */
+ 
+@@ -66,10 +66,10 @@ unsigned long __xchg(unsigned long x, volatile void *ptr, int size)
+ #ifdef __xchg_u64
+ 		return __xchg_u64(x, ptr);
+ #else
+-		local_irq_save(flags);
++		flags = hard_local_irq_save();
+ 		ret = *(volatile u64 *)ptr;
+ 		*(volatile u64 *)ptr = x;
+-		local_irq_restore(flags);
++		hard_local_irq_restore(flags);
+ 		return ret;
+ #endif /* __xchg_u64 */
+ #endif /* CONFIG_64BIT */
+diff --git a/include/asm-generic/irq_pipeline.h b/include/asm-generic/irq_pipeline.h
+new file mode 100644
+index 000000000..0f81ed0e7
+--- /dev/null
++++ b/include/asm-generic/irq_pipeline.h
+@@ -0,0 +1,109 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright (C) 2016 Philippe Gerum  <rpm@xenomai.org>.
++ */
++#ifndef __ASM_GENERIC_IRQ_PIPELINE_H
++#define __ASM_GENERIC_IRQ_PIPELINE_H
++
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++#ifdef CONFIG_IRQ_PIPELINE
++
++unsigned long inband_irq_save(void);
++void inband_irq_restore(unsigned long flags);
++void inband_irq_enable(void);
++void inband_irq_disable(void);
++int inband_irqs_disabled(void);
++
++#define hard_cond_local_irq_enable()		hard_local_irq_enable()
++#define hard_cond_local_irq_disable()		hard_local_irq_disable()
++#define hard_cond_local_irq_save()		hard_local_irq_save()
++#define hard_cond_local_irq_restore(__flags)	hard_local_irq_restore(__flags)
++
++#define hard_local_irq_save()			native_irq_save()
++#define hard_local_irq_restore(__flags)		native_irq_restore(__flags)
++#define hard_local_irq_enable()			native_irq_enable()
++#define hard_local_irq_disable()		native_irq_disable()
++#define hard_local_save_flags()			native_save_flags()
++
++#define hard_irqs_disabled()			native_irqs_disabled()
++#define hard_irqs_disabled_flags(__flags)	native_irqs_disabled_flags(__flags)
++
++void irq_pipeline_nmi_enter(void);
++void irq_pipeline_nmi_exit(void);
++
++/* Swap then merge virtual and hardware interrupt states. */
++#define irqs_merge_flags(__flags, __stalled)				\
++	({								\
++		unsigned long __combo =					\
++			arch_irqs_virtual_to_native_flags(__stalled) |	\
++			arch_irqs_native_to_virtual_flags(__flags);	\
++		__combo;						\
++	})
++
++/* Extract swap virtual and hardware interrupt states. */
++#define irqs_split_flags(__combo, __stall_r)				\
++	({								\
++		unsigned long __virt = (__combo);			\
++		*(__stall_r) = hard_irqs_disabled_flags(__combo);	\
++		__virt &= ~arch_irqs_virtual_to_native_flags(*(__stall_r)); \
++		arch_irqs_virtual_to_native_flags(__virt);		\
++	})
++
++#define hard_local_irq_sync()			native_irq_sync()
++
++#else /* !CONFIG_IRQ_PIPELINE */
++
++#define hard_local_save_flags()			({ unsigned long __flags; \
++						raw_local_save_flags(__flags); __flags; })
++#define hard_local_irq_enable()			raw_local_irq_enable()
++#define hard_local_irq_disable()		raw_local_irq_disable()
++#define hard_local_irq_save()			({ unsigned long __flags; \
++						raw_local_irq_save(__flags); __flags; })
++#define hard_local_irq_restore(__flags)		raw_local_irq_restore(__flags)
++
++#define hard_cond_local_irq_enable()		do { } while(0)
++#define hard_cond_local_irq_disable()		do { } while(0)
++#define hard_cond_local_irq_save()		0
++#define hard_cond_local_irq_restore(__flags)	do { (void)(__flags); } while(0)
++
++#define hard_irqs_disabled()			irqs_disabled()
++#define hard_irqs_disabled_flags(__flags)	raw_irqs_disabled_flags(__flags)
++
++static inline void irq_pipeline_nmi_enter(void) { }
++static inline void irq_pipeline_nmi_exit(void) { }
++
++#define hard_local_irq_sync()			do { } while (0)
++
++#endif /* !CONFIG_IRQ_PIPELINE */
++
++#ifdef CONFIG_DEBUG_IRQ_PIPELINE
++void check_inband_stage(void);
++#define check_hard_irqs_disabled()		\
++	WARN_ON_ONCE(!hard_irqs_disabled())
++#else
++static inline void check_inband_stage(void) { }
++static inline int check_hard_irqs_disabled(void) { return 0; }
++#endif
++
++extern bool irq_pipeline_oopsing;
++
++static __always_inline bool irqs_pipelined(void)
++{
++	return IS_ENABLED(CONFIG_IRQ_PIPELINE);
++}
++
++static __always_inline bool irq_pipeline_debug(void)
++{
++	return IS_ENABLED(CONFIG_DEBUG_IRQ_PIPELINE) &&
++		!irq_pipeline_oopsing;
++}
++
++static __always_inline bool irq_pipeline_debug_locking(void)
++{
++	return IS_ENABLED(CONFIG_DEBUG_HARD_LOCKS);
++}
++
++#endif /* __ASM_GENERIC_IRQ_PIPELINE_H */
+diff --git a/include/asm-generic/percpu.h b/include/asm-generic/percpu.h
+index 6432a7fad..8a35f4816 100644
+--- a/include/asm-generic/percpu.h
++++ b/include/asm-generic/percpu.h
+@@ -125,9 +125,9 @@ do {									\
+ ({									\
+ 	typeof(pcp) ___ret;						\
+ 	unsigned long ___flags;						\
+-	raw_local_irq_save(___flags);					\
++	___flags = hard_local_irq_save();				\
+ 	___ret = raw_cpu_generic_read(pcp);				\
+-	raw_local_irq_restore(___flags);				\
++	hard_local_irq_restore(___flags);				\
+ 	___ret;								\
+ })
+ 
+@@ -144,9 +144,9 @@ do {									\
+ #define this_cpu_generic_to_op(pcp, val, op)				\
+ do {									\
+ 	unsigned long __flags;						\
+-	raw_local_irq_save(__flags);					\
++	__flags = hard_local_irq_save();				\
+ 	raw_cpu_generic_to_op(pcp, val, op);				\
+-	raw_local_irq_restore(__flags);					\
++	hard_local_irq_restore(__flags);				\
+ } while (0)
+ 
+ 
+@@ -154,9 +154,9 @@ do {									\
+ ({									\
+ 	typeof(pcp) __ret;						\
+ 	unsigned long __flags;						\
+-	raw_local_irq_save(__flags);					\
++	__flags = hard_local_irq_save();				\
+ 	__ret = raw_cpu_generic_add_return(pcp, val);			\
+-	raw_local_irq_restore(__flags);					\
++	hard_local_irq_restore(__flags);				\
+ 	__ret;								\
+ })
+ 
+@@ -164,9 +164,9 @@ do {									\
+ ({									\
+ 	typeof(pcp) __ret;						\
+ 	unsigned long __flags;						\
+-	raw_local_irq_save(__flags);					\
++	__flags = hard_local_irq_save();				\
+ 	__ret = raw_cpu_generic_xchg(pcp, nval);			\
+-	raw_local_irq_restore(__flags);					\
++	hard_local_irq_restore(__flags);				\
+ 	__ret;								\
+ })
+ 
+@@ -174,9 +174,9 @@ do {									\
+ ({									\
+ 	typeof(pcp) __ret;						\
+ 	unsigned long __flags;						\
+-	raw_local_irq_save(__flags);					\
++	__flags = hard_local_irq_save();				\
+ 	__ret = raw_cpu_generic_cmpxchg(pcp, oval, nval);		\
+-	raw_local_irq_restore(__flags);					\
++	hard_local_irq_restore(__flags);				\
+ 	__ret;								\
+ })
+ 
+@@ -184,10 +184,10 @@ do {									\
+ ({									\
+ 	int __ret;							\
+ 	unsigned long __flags;						\
+-	raw_local_irq_save(__flags);					\
++	__flags = hard_local_irq_save();				\
+ 	__ret = raw_cpu_generic_cmpxchg_double(pcp1, pcp2,		\
+ 			oval1, oval2, nval1, nval2);			\
+-	raw_local_irq_restore(__flags);					\
++	hard_local_irq_restore(__flags);				\
+ 	__ret;								\
+ })
+ 
+diff --git a/include/dovetail/irq.h b/include/dovetail/irq.h
+new file mode 100644
+index 000000000..ac8b5310e
+--- /dev/null
++++ b/include/dovetail/irq.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _DOVETAIL_IRQ_H
++#define _DOVETAIL_IRQ_H
++
++/* Placeholders for pre- and post-IRQ handling. */
++
++static inline void irq_enter_pipeline(void) { }
++
++static inline void irq_exit_pipeline(void) { }
++
++#endif /* !_DOVETAIL_IRQ_H */
+diff --git a/include/linux/context_tracking_state.h b/include/linux/context_tracking_state.h
+index 65a60d331..814b57d11 100644
+--- a/include/linux/context_tracking_state.h
++++ b/include/linux/context_tracking_state.h
+@@ -28,7 +28,7 @@ DECLARE_PER_CPU(struct context_tracking, context_tracking);
+ 
+ static __always_inline bool context_tracking_enabled(void)
+ {
+-	return static_branch_unlikely(&context_tracking_key);
++	return static_branch_unlikely(&context_tracking_key) && running_inband();
+ }
+ 
+ static __always_inline bool context_tracking_enabled_cpu(int cpu)
+diff --git a/include/linux/hardirq.h b/include/linux/hardirq.h
+index 754f67ac4..955b6ce46 100644
+--- a/include/linux/hardirq.h
++++ b/include/linux/hardirq.h
+@@ -7,6 +7,7 @@
+ #include <linux/lockdep.h>
+ #include <linux/ftrace_irq.h>
+ #include <linux/vtime.h>
++#include <asm-generic/irq_pipeline.h>
+ #include <asm/hardirq.h>
+ 
+ extern void synchronize_irq(unsigned int irq);
+@@ -122,6 +123,7 @@ extern void rcu_nmi_exit(void);
+ 
+ #define nmi_enter()						\
+ 	do {							\
++		irq_pipeline_nmi_enter();			\
+ 		__nmi_enter();					\
+ 		lockdep_hardirq_enter();			\
+ 		rcu_nmi_enter();				\
+@@ -147,6 +149,22 @@ extern void rcu_nmi_exit(void);
+ 		rcu_nmi_exit();					\
+ 		lockdep_hardirq_exit();				\
+ 		__nmi_exit();					\
++		irq_pipeline_nmi_exit();			\
+ 	} while (0)
+ 
++static inline bool start_irq_flow(void)
++{
++	return !irqs_pipelined() || in_pipeline();
++}
++
++static inline bool on_pipeline_entry(void)
++{
++	return irqs_pipelined() && in_pipeline();
++}
++
++static inline bool in_hard_irq(void)
++{
++	return irqs_pipelined() ? in_pipeline() : in_irq();
++}
++
+ #endif /* LINUX_HARDIRQ_H */
+diff --git a/include/linux/interrupt.h b/include/linux/interrupt.h
+index ee8299eb1..0c6656b32 100644
+--- a/include/linux/interrupt.h
++++ b/include/linux/interrupt.h
+@@ -61,6 +61,12 @@
+  *                interrupt handler after suspending interrupts. For system
+  *                wakeup devices users need to implement wakeup detection in
+  *                their interrupt handlers.
++ * IRQF_OOB - Interrupt is attached to an out-of-band handler living
++ *            on the heading stage of the interrupt pipeline
++ *            (CONFIG_IRQ_PIPELINE).  It may be delivered to the
++ *            handler any time interrupts are enabled in the CPU,
++ *            regardless of the (virtualized) interrupt state
++ *            maintained by local_irq_save/disable().
+  */
+ #define IRQF_SHARED		0x00000080
+ #define IRQF_PROBE_SHARED	0x00000100
+@@ -74,6 +80,7 @@
+ #define IRQF_NO_THREAD		0x00010000
+ #define IRQF_EARLY_RESUME	0x00020000
+ #define IRQF_COND_SUSPEND	0x00040000
++#define IRQF_OOB		0x00080000
+ 
+ #define IRQF_TIMER		(__IRQF_TIMER | IRQF_NO_SUSPEND | IRQF_NO_THREAD)
+ 
+@@ -514,9 +521,29 @@ extern bool force_irqthreads;
+  * to ensure that after a local_irq_disable(), interrupts have
+  * really been disabled in hardware. Such architectures need to
+  * implement the following hook.
++ *
++ * Those cases also apply when interrupt pipelining is in effect,
++ * since we are virtualizing the interrupt disable state here too.
+  */
+ #ifndef hard_irq_disable
+-#define hard_irq_disable()	do { } while(0)
++#define hard_irq_disable()	hard_cond_local_irq_disable()
++#endif
++
++/*
++ * Unlike other virtualized interrupt disabling schemes may assume, we
++ * can't expect local_irq_restore() to turn hard interrupts on when
++ * pipelining.  hard_irq_enable() is introduced to be paired with
++ * hard_irq_disable(), for unconditionally turning them on. The only
++ * sane sequence mixing virtual and real disable state manipulation
++ * is:
++ *
++ * 1. local_irq_save/disable
++ * 2. hard_irq_disable
++ * 3. hard_irq_enable
++ * 4. local_irq_restore/enable
++ */
++#ifndef hard_irq_enable
++#define hard_irq_enable()	hard_cond_local_irq_enable()
+ #endif
+ 
+ /* PLEASE, avoid to allocate new softirqs, if you need not _really_ high
+diff --git a/include/linux/irq.h b/include/linux/irq.h
+index 607bee927..4ba8f2aab 100644
+--- a/include/linux/irq.h
++++ b/include/linux/irq.h
+@@ -16,6 +16,7 @@
+ #include <linux/irqhandler.h>
+ #include <linux/irqreturn.h>
+ #include <linux/irqnr.h>
++#include <linux/irq_work.h>
+ #include <linux/topology.h>
+ #include <linux/io.h>
+ #include <linux/slab.h>
+@@ -72,6 +73,11 @@ enum irqchip_irq_state;
+  *				  mechanism and from core side polling.
+  * IRQ_DISABLE_UNLAZY		- Disable lazy irq disable
+  * IRQ_HIDDEN			- Don't show up in /proc/interrupts
++ * IRQ_OOB                      - Interrupt can be delivered to the out-of-band handler
++ *                                when pipelining is enabled (CONFIG_IRQ_PIPELINE),
++ *                                regardless of the (virtualized) interrupt state
++ *                                maintained by local_irq_save/disable().
++ * IRQ_CHAINED                  - Interrupt is chained.
+  */
+ enum {
+ 	IRQ_TYPE_NONE		= 0x00000000,
+@@ -99,13 +105,15 @@ enum {
+ 	IRQ_IS_POLLED		= (1 << 18),
+ 	IRQ_DISABLE_UNLAZY	= (1 << 19),
+ 	IRQ_HIDDEN		= (1 << 20),
++	IRQ_OOB			= (1 << 21),
++	IRQ_CHAINED		= (1 << 22),
+ };
+ 
+ #define IRQF_MODIFY_MASK	\
+ 	(IRQ_TYPE_SENSE_MASK | IRQ_NOPROBE | IRQ_NOREQUEST | \
+ 	 IRQ_NOAUTOEN | IRQ_MOVE_PCNTXT | IRQ_LEVEL | IRQ_NO_BALANCING | \
+ 	 IRQ_PER_CPU | IRQ_NESTED_THREAD | IRQ_NOTHREAD | IRQ_PER_CPU_DEVID | \
+-	 IRQ_IS_POLLED | IRQ_DISABLE_UNLAZY | IRQ_HIDDEN)
++	 IRQ_IS_POLLED | IRQ_DISABLE_UNLAZY | IRQ_HIDDEN | IRQ_OOB)
+ 
+ #define IRQ_NO_BALANCING_MASK	(IRQ_PER_CPU | IRQ_NO_BALANCING)
+ 
+@@ -171,6 +179,7 @@ struct irq_common_data {
+  *			irq_domain
+  * @chip_data:		platform-specific per-chip private data for the chip
+  *			methods, to allow shared chip implementations
++ * @move_work:		irq_work for setaffinity deferral when pipelining irqs
+  */
+ struct irq_data {
+ 	u32			mask;
+@@ -181,6 +190,9 @@ struct irq_data {
+ 	struct irq_domain	*domain;
+ #ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+ 	struct irq_data		*parent_data;
++#endif
++#if defined(CONFIG_IRQ_PIPELINE) && defined(CONFIG_GENERIC_PENDING_IRQ)
++	struct irq_work		move_work;
+ #endif
+ 	void			*chip_data;
+ };
+@@ -219,6 +231,7 @@ struct irq_data {
+  *				  irq_chip::irq_set_affinity() when deactivated.
+  * IRQD_IRQ_ENABLED_ON_SUSPEND	- Interrupt is enabled on suspend by irq pm if
+  *				  irqchip have flag IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND set.
++ * IRQD_SETAFFINITY_BLOCKED	- Pending affinity setting on hold (IRQ_PIPELINE)
+  */
+ enum {
+ 	IRQD_TRIGGER_MASK		= 0xf,
+@@ -245,6 +258,7 @@ enum {
+ 	IRQD_HANDLE_ENFORCE_IRQCTX	= (1 << 28),
+ 	IRQD_AFFINITY_ON_ACTIVATE	= (1 << 29),
+ 	IRQD_IRQ_ENABLED_ON_SUSPEND	= (1 << 30),
++	IRQD_SETAFFINITY_BLOCKED	= (1 << 31),
+ };
+ 
+ #define __irqd_to_state(d) ACCESS_PRIVATE((d)->common, state_use_accessors)
+@@ -254,6 +268,21 @@ static inline bool irqd_is_setaffinity_pending(struct irq_data *d)
+ 	return __irqd_to_state(d) & IRQD_SETAFFINITY_PENDING;
+ }
+ 
++static inline void irqd_set_move_blocked(struct irq_data *d)
++{
++	__irqd_to_state(d) |= IRQD_SETAFFINITY_BLOCKED;
++}
++
++static inline void irqd_clr_move_blocked(struct irq_data *d)
++{
++	__irqd_to_state(d) &= ~IRQD_SETAFFINITY_BLOCKED;
++}
++
++static inline bool irqd_is_setaffinity_blocked(struct irq_data *d)
++{
++	return irqs_pipelined() && __irqd_to_state(d) & IRQD_SETAFFINITY_BLOCKED;
++}
++
+ static inline bool irqd_is_per_cpu(struct irq_data *d)
+ {
+ 	return __irqd_to_state(d) & IRQD_PER_CPU;
+@@ -568,6 +597,7 @@ struct irq_chip {
+  * IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND:  Invokes __enable_irq()/__disable_irq() for wake irqs
+  *                                    in the suspend path if they are in disabled state
+  * IRQCHIP_AFFINITY_PRE_STARTUP:      Default affinity update before startup
++ * IRQCHIP_PIPELINE_SAFE:             Chip can work in pipelined mode
+  */
+ enum {
+ 	IRQCHIP_SET_TYPE_MASKED			= (1 <<  0),
+@@ -581,6 +611,7 @@ enum {
+ 	IRQCHIP_SUPPORTS_NMI			= (1 <<  8),
+ 	IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND	= (1 <<  9),
+ 	IRQCHIP_AFFINITY_PRE_STARTUP		= (1 << 10),
++	IRQCHIP_PIPELINE_SAFE			= (1 << 11),
+ };
+ 
+ #include <linux/irqdesc.h>
+@@ -658,6 +689,7 @@ extern void handle_percpu_irq(struct irq_desc *desc);
+ extern void handle_percpu_devid_irq(struct irq_desc *desc);
+ extern void handle_bad_irq(struct irq_desc *desc);
+ extern void handle_nested_irq(unsigned int irq);
++extern void handle_synthetic_irq(struct irq_desc *desc);
+ 
+ extern void handle_fasteoi_nmi(struct irq_desc *desc);
+ extern void handle_percpu_devid_fasteoi_nmi(struct irq_desc *desc);
+@@ -808,7 +840,13 @@ extern int irq_set_irq_type(unsigned int irq, unsigned int type);
+ extern int irq_set_msi_desc(unsigned int irq, struct msi_desc *entry);
+ extern int irq_set_msi_desc_off(unsigned int irq_base, unsigned int irq_offset,
+ 				struct msi_desc *entry);
+-extern struct irq_data *irq_get_irq_data(unsigned int irq);
++
++static inline struct irq_data *irq_get_irq_data(unsigned int irq)
++{
++	struct irq_desc *desc = irq_to_desc(irq);
++
++	return desc ? &desc->irq_data : NULL;
++}
+ 
+ static inline struct irq_chip *irq_get_chip(unsigned int irq)
+ {
+@@ -1051,7 +1089,7 @@ struct irq_chip_type {
+  * different flow mechanisms (level/edge) for it.
+  */
+ struct irq_chip_generic {
+-	raw_spinlock_t		lock;
++	hard_spinlock_t		lock;
+ 	void __iomem		*reg_base;
+ 	u32			(*reg_readl)(void __iomem *addr);
+ 	void			(*reg_writel)(u32 val, void __iomem *addr);
+@@ -1178,6 +1216,12 @@ static inline struct irq_chip_type *irq_data_get_chip_type(struct irq_data *d)
+ 
+ #define IRQ_MSK(n) (u32)((n) < 32 ? ((1 << (n)) - 1) : UINT_MAX)
+ 
++#ifdef CONFIG_IRQ_PIPELINE
++
++int irq_switch_oob(unsigned int irq, bool on);
++
++#endif	/* !CONFIG_IRQ_PIPELINE */
++
+ #ifdef CONFIG_SMP
+ static inline void irq_gc_lock(struct irq_chip_generic *gc)
+ {
+diff --git a/include/linux/irq_pipeline.h b/include/linux/irq_pipeline.h
+new file mode 100644
+index 000000000..fda0a7dd9
+--- /dev/null
++++ b/include/linux/irq_pipeline.h
+@@ -0,0 +1,135 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright (C) 2002 Philippe Gerum  <rpm@xenomai.org>.
++ *               2006 Gilles Chanteperdrix.
++ *               2007 Jan Kiszka.
++ */
++#ifndef _LINUX_IRQ_PIPELINE_H
++#define _LINUX_IRQ_PIPELINE_H
++
++struct cpuidle_device;
++struct cpuidle_state;
++struct irq_desc;
++
++#ifdef CONFIG_IRQ_PIPELINE
++
++#include <linux/compiler.h>
++#include <linux/irqdomain.h>
++#include <linux/percpu.h>
++#include <linux/interrupt.h>
++#include <linux/irqstage.h>
++#include <linux/thread_info.h>
++#include <asm/irqflags.h>
++
++void irq_pipeline_init_early(void);
++
++void irq_pipeline_init(void);
++
++void arch_irq_pipeline_init(void);
++
++int irq_inject_pipeline(unsigned int irq);
++
++void synchronize_pipeline(void);
++
++static __always_inline void synchronize_pipeline_on_irq(void)
++{
++	/*
++	 * Optimize if we preempted the high priority oob stage: we
++	 * don't need to synchronize the pipeline unless there is a
++	 * pending interrupt for it.
++	 */
++	if (running_inband() ||
++	    stage_irqs_pending(this_oob_staged()))
++		synchronize_pipeline();
++}
++
++bool handle_oob_irq(struct irq_desc *desc);
++
++void arch_do_IRQ_pipelined(struct irq_desc *desc);
++
++#ifdef CONFIG_SMP
++void irq_pipeline_send_remote(unsigned int ipi,
++			      const struct cpumask *cpumask);
++#endif	/* CONFIG_SMP */
++
++void irq_pipeline_oops(void);
++
++bool irq_cpuidle_enter(struct cpuidle_device *dev,
++		       struct cpuidle_state *state);
++
++int run_oob_call(int (*fn)(void *arg), void *arg);
++
++extern bool irq_pipeline_active;
++
++static inline bool inband_unsafe(void)
++{
++	return running_oob() ||
++		(hard_irqs_disabled() && irq_pipeline_active);
++}
++
++static inline bool inband_irq_pending(void)
++{
++	check_hard_irqs_disabled();
++
++	return stage_irqs_pending(this_inband_staged());
++}
++
++struct irq_stage_data *
++handle_irq_pipelined_prepare(struct pt_regs *regs);
++
++int handle_irq_pipelined_finish(struct irq_stage_data *prevd,
++				struct pt_regs *regs);
++
++int handle_irq_pipelined(struct pt_regs *regs);
++
++void sync_inband_irqs(void);
++
++extern struct irq_domain *synthetic_irq_domain;
++
++#else /* !CONFIG_IRQ_PIPELINE */
++
++#include <linux/irqstage.h>
++#include <asm/irq_pipeline.h>
++
++static inline
++void irq_pipeline_init_early(void) { }
++
++static inline
++void irq_pipeline_init(void) { }
++
++static inline
++void irq_pipeline_oops(void) { }
++
++static inline bool handle_oob_irq(struct irq_desc *desc)
++{
++	return false;
++}
++
++static inline bool irq_cpuidle_enter(struct cpuidle_device *dev,
++				     struct cpuidle_state *state)
++{
++	return true;
++}
++
++static inline bool inband_unsafe(void)
++{
++	return false;
++}
++
++static inline bool inband_irq_pending(void)
++{
++	return false;
++}
++
++static inline void sync_inband_irqs(void) { }
++
++#endif /* !CONFIG_IRQ_PIPELINE */
++
++#if !defined(CONFIG_IRQ_PIPELINE) || !defined(CONFIG_SPARSE_IRQ)
++static inline void uncache_irq_desc(unsigned int irq) { }
++#else
++void uncache_irq_desc(unsigned int irq);
++#endif
++
++#endif /* _LINUX_IRQ_PIPELINE_H */
+diff --git a/include/linux/irqdesc.h b/include/linux/irqdesc.h
+index 574549130..eced0de5f 100644
+--- a/include/linux/irqdesc.h
++++ b/include/linux/irqdesc.h
+@@ -68,7 +68,7 @@ struct irq_desc {
+ 	unsigned int		irqs_unhandled;
+ 	atomic_t		threads_handled;
+ 	int			threads_handled_last;
+-	raw_spinlock_t		lock;
++	hybrid_spinlock_t	lock;
+ 	struct cpumask		*percpu_enabled;
+ 	const struct cpumask	*percpu_affinity;
+ #ifdef CONFIG_SMP
+@@ -154,6 +154,8 @@ static inline void generic_handle_irq_desc(struct irq_desc *desc)
+ 
+ int generic_handle_irq(unsigned int irq);
+ 
++int generic_pipeline_irq(unsigned int irq, struct pt_regs *regs);
++
+ #ifdef CONFIG_HANDLE_DOMAIN_IRQ
+ /*
+  * Convert a HW interrupt number to a logical one using a IRQ domain,
+@@ -164,11 +166,24 @@ int generic_handle_irq(unsigned int irq);
+ int __handle_domain_irq(struct irq_domain *domain, unsigned int hwirq,
+ 			bool lookup, struct pt_regs *regs);
+ 
++#ifdef CONFIG_IRQ_PIPELINE
++unsigned int irq_find_mapping(struct irq_domain *host,
++			irq_hw_number_t hwirq);
++
++static inline int handle_domain_irq(struct irq_domain *domain,
++				    unsigned int hwirq, struct pt_regs *regs)
++{
++	unsigned int irq = irq_find_mapping(domain, hwirq);
++
++	return generic_pipeline_irq(irq, regs);
++}
++#else
+ static inline int handle_domain_irq(struct irq_domain *domain,
+ 				    unsigned int hwirq, struct pt_regs *regs)
+ {
+ 	return __handle_domain_irq(domain, hwirq, true, regs);
+ }
++#endif	/* !CONFIG_IRQ_PIPELINE */
+ 
+ #ifdef CONFIG_IRQ_DOMAIN
+ int handle_domain_nmi(struct irq_domain *domain, unsigned int hwirq,
+@@ -252,6 +267,14 @@ static inline bool irq_is_percpu_devid(unsigned int irq)
+ 	return desc->status_use_accessors & IRQ_PER_CPU_DEVID;
+ }
+ 
++static inline int irq_is_oob(unsigned int irq)
++{
++	struct irq_desc *desc;
++
++	desc = irq_to_desc(irq);
++	return desc->status_use_accessors & IRQ_OOB;
++}
++
+ static inline void
+ irq_set_lockdep_class(unsigned int irq, struct lock_class_key *lock_class,
+ 		      struct lock_class_key *request_class)
+diff --git a/include/linux/irqflags.h b/include/linux/irqflags.h
+index 3ed4e8771..344a15cda 100644
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@ -13,6 +13,7 @@
+ #define _LINUX_TRACE_IRQFLAGS_H
+ 
+ #include <linux/typecheck.h>
++#include <asm-generic/irq_pipeline.h>
+ #include <asm/irqflags.h>
+ #include <asm/percpu.h>
+ 
+@@ -228,6 +229,38 @@ do {						\
+ 
+ #endif /* CONFIG_TRACE_IRQFLAGS */
+ 
++#ifdef CONFIG_IRQ_PIPELINE
++#define local_irq_enable_full()			\
++	do {					\
++		hard_local_irq_enable();	\
++		local_irq_enable();		\
++	} while (0)
++
++#define local_irq_disable_full()		\
++	do {					\
++		local_irq_disable();		\
++		hard_local_irq_disable();	\
++	} while (0)
++
++#define local_irq_save_full(__flags)		\
++  	do {					\
++		local_irq_save(__flags);	\
++		hard_local_irq_disable();	\
++	} while (0)
++
++#define local_irq_restore_full(__flags)			\
++	do {						\
++		if (!irqs_disabled_flags(__flags))	\
++			hard_local_irq_enable();	\
++		local_irq_restore(__flags);		\
++	} while (0)
++#else
++#define local_irq_enable_full()		local_irq_enable()
++#define local_irq_disable_full()	local_irq_disable()
++#define local_irq_save_full(__flags)	local_irq_save(__flags)
++#define local_irq_restore_full(__flags)	local_irq_restore(__flags)
++#endif
++
+ #define local_save_flags(flags)	raw_local_save_flags(flags)
+ 
+ /*
+diff --git a/include/linux/irqstage.h b/include/linux/irqstage.h
+new file mode 100644
+index 000000000..3e60bb78e
+--- /dev/null
++++ b/include/linux/irqstage.h
+@@ -0,0 +1,389 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright (C) 2016, 2019 Philippe Gerum  <rpm@xenomai.org>.
++ */
++#ifndef _LINUX_IRQSTAGE_H
++#define _LINUX_IRQSTAGE_H
++
++#ifdef CONFIG_IRQ_PIPELINE
++
++#include <linux/percpu.h>
++#include <linux/bitops.h>
++#include <linux/preempt.h>
++#include <linux/sched.h>
++#include <asm/irq_pipeline.h>
++
++struct irq_stage {
++	int index;
++	const char *name;
++};
++
++extern struct irq_stage inband_stage;
++
++extern struct irq_stage oob_stage;
++
++struct irq_event_map;
++
++struct irq_log {
++	unsigned long index_0;
++	struct irq_event_map *map;
++};
++
++/* Per-CPU, per-stage data. */
++struct irq_stage_data {
++	struct irq_log log;
++	struct irq_stage *stage;
++#ifdef CONFIG_DEBUG_IRQ_PIPELINE
++	int cpu;
++#endif
++};
++
++/* Per-CPU pipeline descriptor. */
++struct irq_pipeline_data {
++	struct irq_stage_data stages[2];
++	struct pt_regs tick_regs;
++};
++
++DECLARE_PER_CPU(struct irq_pipeline_data, irq_pipeline);
++
++/*
++ * The low-level stall bit accessors. Should be used by the Dovetail
++ * core implementation exclusively, inband_irq_*() and oob_irq_*()
++ * accessors are available to common code.
++ */
++
++#define INBAND_STALL_BIT  0
++#define OOB_STALL_BIT     1
++
++static __always_inline void init_task_stall_bits(struct task_struct *p)
++{
++	__set_bit(INBAND_STALL_BIT, &p->stall_bits);
++	__clear_bit(OOB_STALL_BIT, &p->stall_bits);
++}
++
++static __always_inline void stall_inband_nocheck(void)
++{
++	__set_bit(INBAND_STALL_BIT, &current->stall_bits);
++	barrier();
++}
++
++static __always_inline void stall_inband(void)
++{
++	WARN_ON_ONCE(irq_pipeline_debug() && running_oob());
++	stall_inband_nocheck();
++}
++
++static __always_inline void unstall_inband_nocheck(void)
++{
++	barrier();
++	__clear_bit(INBAND_STALL_BIT, &current->stall_bits);
++}
++
++static __always_inline void unstall_inband(void)
++{
++	WARN_ON_ONCE(irq_pipeline_debug() && running_oob());
++	unstall_inband_nocheck();
++}
++
++static __always_inline int test_and_stall_inband_nocheck(void)
++{
++	return __test_and_set_bit(INBAND_STALL_BIT, &current->stall_bits);
++}
++
++static __always_inline int test_and_stall_inband(void)
++{
++	WARN_ON_ONCE(irq_pipeline_debug() && running_oob());
++	return test_and_stall_inband_nocheck();
++}
++
++static __always_inline int test_inband_stall(void)
++{
++	return test_bit(INBAND_STALL_BIT, &current->stall_bits);
++}
++
++static __always_inline void stall_oob(void)
++{
++	__set_bit(OOB_STALL_BIT, &current->stall_bits);
++	barrier();
++}
++
++static __always_inline void unstall_oob(void)
++{
++	barrier();
++	__clear_bit(OOB_STALL_BIT, &current->stall_bits);
++}
++
++static __always_inline int test_and_stall_oob(void)
++{
++	return __test_and_set_bit(OOB_STALL_BIT, &current->stall_bits);
++}
++
++static __always_inline int test_oob_stall(void)
++{
++	return test_bit(OOB_STALL_BIT, &current->stall_bits);
++}
++
++/**
++ * this_staged - IRQ stage data on the current CPU
++ *
++ * Return the address of @stage's data on the current CPU. IRQs must
++ * be hard disabled to prevent CPU migration.
++ */
++static __always_inline
++struct irq_stage_data *this_staged(struct irq_stage *stage)
++{
++	return &raw_cpu_ptr(irq_pipeline.stages)[stage->index];
++}
++
++/**
++ * percpu_inband_staged - IRQ stage data on specified CPU
++ *
++ * Return the address of @stage's data on @cpu.
++ *
++ * This is the slowest accessor, use it carefully. Prefer
++ * this_staged() for requests referring to the current
++ * CPU. Additionally, if the target stage is known at build time,
++ * consider using this_{inband, oob}_staged() instead.
++ */
++static __always_inline
++struct irq_stage_data *percpu_inband_staged(struct irq_stage *stage, int cpu)
++{
++	return &per_cpu(irq_pipeline.stages, cpu)[stage->index];
++}
++
++/**
++ * this_inband_staged - return the address of the pipeline context
++ * data for the inband stage on the current CPU. CPU migration must be
++ * disabled.
++ *
++ * This accessor is recommended when the stage we refer to is known at
++ * build time to be the inband one.
++ */
++static __always_inline struct irq_stage_data *this_inband_staged(void)
++{
++	return raw_cpu_ptr(&irq_pipeline.stages[0]);
++}
++
++/**
++ * this_oob_staged - return the address of the pipeline context data
++ * for the registered oob stage on the current CPU. CPU migration must
++ * be disabled.
++ *
++ * This accessor is recommended when the stage we refer to is known at
++ * build time to be the registered oob stage. This address is always
++ * different from the context data of the inband stage, even in
++ * absence of registered oob stage.
++ */
++static __always_inline struct irq_stage_data *this_oob_staged(void)
++{
++	return raw_cpu_ptr(&irq_pipeline.stages[1]);
++}
++
++static __always_inline struct irq_stage_data *__current_irq_staged(void)
++{
++	return &raw_cpu_ptr(irq_pipeline.stages)[stage_level()];
++}
++
++/**
++ * current_irq_staged - return the address of the pipeline context
++ * data for the current stage. CPU migration must be disabled.
++ */
++#define current_irq_staged __current_irq_staged()
++
++static __always_inline
++void check_staged_locality(struct irq_stage_data *pd)
++{
++#ifdef CONFIG_DEBUG_IRQ_PIPELINE
++	/*
++	 * Setting our context with another processor's is a really
++	 * bad idea, our caller definitely went loopy.
++	 */
++	WARN_ON_ONCE(raw_smp_processor_id() != pd->cpu);
++#endif
++}
++
++/**
++ * switch_oob(), switch_inband() - switch the current CPU to the
++ * specified stage context. CPU migration must be disabled.
++ *
++ * Calling these routines is the only sane and safe way to change the
++ * interrupt stage for the current CPU. Don't bypass them, ever.
++ * Really.
++ */
++static __always_inline
++void switch_oob(struct irq_stage_data *pd)
++{
++	check_staged_locality(pd);
++	if (!(preempt_count() & STAGE_MASK))
++		preempt_count_add(STAGE_OFFSET);
++}
++
++static __always_inline
++void switch_inband(struct irq_stage_data *pd)
++{
++	check_staged_locality(pd);
++	if (preempt_count() & STAGE_MASK)
++		preempt_count_sub(STAGE_OFFSET);
++}
++
++static __always_inline
++void set_current_irq_staged(struct irq_stage_data *pd)
++{
++	if (pd->stage == &inband_stage)
++		switch_inband(pd);
++	else
++		switch_oob(pd);
++}
++
++static __always_inline struct irq_stage *__current_irq_stage(void)
++{
++	/*
++	 * We don't have to hard disable irqs while accessing the
++	 * per-CPU stage data here, because there is no way we could
++	 * switch stage and CPU at the same time.
++	 */
++	return __current_irq_staged()->stage;
++}
++
++#define current_irq_stage	__current_irq_stage()
++
++static __always_inline bool oob_stage_present(void)
++{
++	return oob_stage.index != 0;
++}
++
++/**
++ * stage_irqs_pending() - Whether we have interrupts pending
++ * (i.e. logged) on the current CPU for the given stage. Hard IRQs
++ * must be disabled.
++ */
++static __always_inline int stage_irqs_pending(struct irq_stage_data *pd)
++{
++	return pd->log.index_0 != 0;
++}
++
++void sync_current_irq_stage(void);
++
++void sync_irq_stage(struct irq_stage *top);
++
++void irq_post_stage(struct irq_stage *stage,
++		    unsigned int irq);
++
++static __always_inline void irq_post_oob(unsigned int irq)
++{
++	irq_post_stage(&oob_stage, irq);
++}
++
++static __always_inline void irq_post_inband(unsigned int irq)
++{
++	irq_post_stage(&inband_stage, irq);
++}
++
++static __always_inline void oob_irq_disable(void)
++{
++	hard_local_irq_disable();
++	stall_oob();
++}
++
++static __always_inline unsigned long oob_irq_save(void)
++{
++	hard_local_irq_disable();
++	return test_and_stall_oob();
++}
++
++static __always_inline int oob_irqs_disabled(void)
++{
++	return test_oob_stall();
++}
++
++void oob_irq_enable(void);
++
++void __oob_irq_restore(unsigned long x);
++
++static __always_inline void oob_irq_restore(unsigned long x)
++{
++	if ((x ^ test_oob_stall()) & 1)
++		__oob_irq_restore(x);
++}
++
++bool stage_disabled(void);
++
++unsigned long test_and_lock_stage(int *irqsoff);
++
++void unlock_stage(unsigned long irqstate);
++
++#define stage_save_flags(__irqstate)					\
++  	do {								\
++	  unsigned long __flags = hard_local_save_flags();		\
++	  (__irqstate) = irqs_merge_flags(__flags,			\
++					  irqs_disabled());		\
++	} while (0)
++
++int enable_oob_stage(const char *name);
++
++int arch_enable_oob_stage(void);
++
++void disable_oob_stage(void);
++
++#else /* !CONFIG_IRQ_PIPELINE */
++
++#include <linux/irqflags.h>
++
++void call_is_nop_without_pipelining(void);
++
++static __always_inline void stall_inband(void) { }
++
++static __always_inline void unstall_inband(void) { }
++
++static __always_inline int test_and_stall_inband(void)
++{
++	return false;
++}
++
++static __always_inline int test_inband_stall(void)
++{
++	return false;
++}
++
++static __always_inline bool oob_stage_present(void)
++{
++	return false;
++}
++
++static __always_inline bool stage_disabled(void)
++{
++	return irqs_disabled();
++}
++
++static __always_inline void irq_post_inband(unsigned int irq)
++{
++	call_is_nop_without_pipelining();
++}
++
++#define test_and_lock_stage(__irqsoff)				\
++	({							\
++		unsigned long __flags;				\
++		raw_local_irq_save(__flags);			\
++		*(__irqsoff) = irqs_disabled_flags(__flags);	\
++		__flags;					\
++	})
++
++#define unlock_stage(__flags)		raw_local_irq_restore(__flags)
++
++#define stage_save_flags(__flags)	raw_local_save_flags(__flags)
++
++static __always_inline void stall_inband_nocheck(void)
++{ }
++
++static __always_inline void unstall_inband_nocheck(void)
++{ }
++
++static __always_inline int test_and_stall_inband_nocheck(void)
++{
++	return irqs_disabled();
++}
++
++#endif /* !CONFIG_IRQ_PIPELINE */
++
++#endif	/* !_LINUX_IRQSTAGE_H */
+diff --git a/include/linux/kernel.h b/include/linux/kernel.h
+index f5392d96d..c212bfefb 100644
+--- a/include/linux/kernel.h
++++ b/include/linux/kernel.h
+@@ -15,6 +15,7 @@
+ #include <linux/typecheck.h>
+ #include <linux/printk.h>
+ #include <linux/build_bug.h>
++#include <asm-generic/irq_pipeline.h>
+ #include <asm/byteorder.h>
+ #include <asm/div64.h>
+ #include <uapi/linux/kernel.h>
+@@ -195,9 +196,12 @@ struct user;
+ 
+ #ifdef CONFIG_PREEMPT_VOLUNTARY
+ extern int _cond_resched(void);
+-# define might_resched() _cond_resched()
++# define might_resched() do { \
++		check_inband_stage(); \
++		_cond_resched(); \
++	} while (0)
+ #else
+-# define might_resched() do { } while (0)
++# define might_resched() check_inband_stage()
+ #endif
+ 
+ #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+diff --git a/include/linux/lockdep.h b/include/linux/lockdep.h
+index 2c2586312..28d1cffe1 100644
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@ -215,25 +215,25 @@ static inline void lockdep_init_map(struct lockdep_map *lock, const char *name,
+  * or they are too narrow (they suffer from a false class-split):
+  */
+ #define lockdep_set_class(lock, key)				\
+-	lockdep_init_map_type(&(lock)->dep_map, #key, key, 0,	\
++	lockdep_init_map_type(LOCKDEP_ALT_DEPMAP(lock), #key, key, 0,	\
+ 			      (lock)->dep_map.wait_type_inner,	\
+ 			      (lock)->dep_map.wait_type_outer,	\
+ 			      (lock)->dep_map.lock_type)
+ 
+ #define lockdep_set_class_and_name(lock, key, name)		\
+-	lockdep_init_map_type(&(lock)->dep_map, name, key, 0,	\
++	lockdep_init_map_type(LOCKDEP_ALT_DEPMAP(lock), name, key, 0,	\
+ 			      (lock)->dep_map.wait_type_inner,	\
+ 			      (lock)->dep_map.wait_type_outer,	\
+ 			      (lock)->dep_map.lock_type)
+ 
+ #define lockdep_set_class_and_subclass(lock, key, sub)		\
+-	lockdep_init_map_type(&(lock)->dep_map, #key, key, sub,	\
++	lockdep_init_map_type(LOCKDEP_ALT_DEPMAP(lock), #key, key, sub,	\
+ 			      (lock)->dep_map.wait_type_inner,	\
+ 			      (lock)->dep_map.wait_type_outer,	\
+ 			      (lock)->dep_map.lock_type)
+ 
+ #define lockdep_set_subclass(lock, sub)					\
+-	lockdep_init_map_type(&(lock)->dep_map, #lock, (lock)->dep_map.key, sub,\
++	lockdep_init_map_type(LOCKDEP_ALT_DEPMAP(lock), #lock, (lock)->dep_map.key, sub,\
+ 			      (lock)->dep_map.wait_type_inner,		\
+ 			      (lock)->dep_map.wait_type_outer,		\
+ 			      (lock)->dep_map.lock_type)
+@@ -244,7 +244,8 @@ static inline void lockdep_init_map(struct lockdep_map *lock, const char *name,
+ /*
+  * Compare locking classes
+  */
+-#define lockdep_match_class(lock, key) lockdep_match_key(&(lock)->dep_map, key)
++#define lockdep_match_class(lock, key) \
++	lockdep_match_key(LOCKDEP_ALT_DEPMAP(lock), key)
+ 
+ static inline int lockdep_match_key(struct lockdep_map *lock,
+ 				    struct lock_class_key *key)
+@@ -282,8 +283,8 @@ static inline int lock_is_held(const struct lockdep_map *lock)
+ 	return lock_is_held_type(lock, -1);
+ }
+ 
+-#define lockdep_is_held(lock)		lock_is_held(&(lock)->dep_map)
+-#define lockdep_is_held_type(lock, r)	lock_is_held_type(&(lock)->dep_map, (r))
++#define lockdep_is_held(lock)		lock_is_held(LOCKDEP_ALT_DEPMAP(lock))
++#define lockdep_is_held_type(lock, r)	lock_is_held_type(LOCKDEP_ALT_DEPMAP(lock), (r))
+ 
+ extern void lock_set_class(struct lockdep_map *lock, const char *name,
+ 			   struct lock_class_key *key, unsigned int subclass,
+@@ -306,26 +307,27 @@ extern void lock_unpin_lock(struct lockdep_map *lock, struct pin_cookie);
+ #define lockdep_depth(tsk)	(debug_locks ? (tsk)->lockdep_depth : 0)
+ 
+ #define lockdep_assert_held(l)	do {				\
+-		WARN_ON(debug_locks && !lockdep_is_held(l));	\
++		WARN_ON(debug_locks && !LOCKDEP_HARD_DEBUG_RET(l, 1, lockdep_is_held(l))); \
+ 	} while (0)
+ 
+ #define lockdep_assert_held_write(l)	do {			\
+-		WARN_ON(debug_locks && !lockdep_is_held_type(l, 0));	\
++		WARN_ON(debug_locks && !LOCKDEP_HARD_DEBUG_RET(l, 1, lockdep_is_held_type(l, 0))); \
+ 	} while (0)
+ 
+ #define lockdep_assert_held_read(l)	do {				\
+-		WARN_ON(debug_locks && !lockdep_is_held_type(l, 1));	\
++		WARN_ON(debug_locks && !LOCKDEP_HARD_DEBUG_RET(l, 1, lockdep_is_held_type(l, 1))); \
+ 	} while (0)
+ 
+ #define lockdep_assert_held_once(l)	do {				\
+-		WARN_ON_ONCE(debug_locks && !lockdep_is_held(l));	\
++		WARN_ON_ONCE(debug_locks && !LOCKDEP_HARD_DEBUG_RET(l, 1, lockdep_is_held(l))); \
+ 	} while (0)
+ 
+ #define lockdep_recursing(tsk)	((tsk)->lockdep_recursion)
+ 
+-#define lockdep_pin_lock(l)	lock_pin_lock(&(l)->dep_map)
+-#define lockdep_repin_lock(l,c)	lock_repin_lock(&(l)->dep_map, (c))
+-#define lockdep_unpin_lock(l,c)	lock_unpin_lock(&(l)->dep_map, (c))
++#define lockdep_pin_lock(l)	LOCKDEP_HARD_DEBUG_RET(l, ({ struct pin_cookie cookie; cookie;} ), \
++							lock_pin_lock(LOCKDEP_ALT_DEPMAP(l)))
++#define lockdep_repin_lock(l,c)	LOCKDEP_HARD_DEBUG(l,, lock_repin_lock(LOCKDEP_ALT_DEPMAP(l), (c)))
++#define lockdep_unpin_lock(l,c)	LOCKDEP_HARD_DEBUG(l,, lock_unpin_lock(LOCKDEP_ALT_DEPMAP(l), (c)))
+ 
+ #else /* !CONFIG_LOCKDEP */
+ 
+@@ -578,12 +580,17 @@ DECLARE_PER_CPU(unsigned int, lockdep_recursion);
+ 
+ #define lockdep_assert_irqs_enabled()					\
+ do {									\
+-	WARN_ON_ONCE(__lockdep_enabled && !this_cpu_read(hardirqs_enabled)); \
++	WARN_ON_ONCE(__lockdep_enabled &&				\
++		((running_oob() && hard_irqs_disabled()) ||		\
++		 (running_inband() && !this_cpu_read(hardirqs_enabled)))); \
+ } while (0)
+ 
+ #define lockdep_assert_irqs_disabled()					\
+ do {									\
+-	WARN_ON_ONCE(__lockdep_enabled && this_cpu_read(hardirqs_enabled)); \
++	WARN_ON_ONCE(__lockdep_enabled &&				\
++		((running_oob() && !hard_irqs_disabled()) ||		\
++		(running_inband() && this_cpu_read(hardirqs_enabled) &&\
++		 (!irqs_pipelined() || !hard_irqs_disabled()))));	\
+ } while (0)
+ 
+ #define lockdep_assert_in_irq()						\
+diff --git a/include/linux/preempt.h b/include/linux/preempt.h
+index 7d9c1c0e1..58c21bc46 100644
+--- a/include/linux/preempt.h
++++ b/include/linux/preempt.h
+@@ -27,17 +27,23 @@
+  *         SOFTIRQ_MASK:	0x0000ff00
+  *         HARDIRQ_MASK:	0x000f0000
+  *             NMI_MASK:	0x00f00000
++ *         PIPELINE_MASK:	0x01000000
++ *         STAGE_MASK:		0x02000000
+  * PREEMPT_NEED_RESCHED:	0x80000000
+  */
+ #define PREEMPT_BITS	8
+ #define SOFTIRQ_BITS	8
+ #define HARDIRQ_BITS	4
+ #define NMI_BITS	4
++#define PIPELINE_BITS	1
++#define STAGE_BITS	1
+ 
+ #define PREEMPT_SHIFT	0
+ #define SOFTIRQ_SHIFT	(PREEMPT_SHIFT + PREEMPT_BITS)
+ #define HARDIRQ_SHIFT	(SOFTIRQ_SHIFT + SOFTIRQ_BITS)
+ #define NMI_SHIFT	(HARDIRQ_SHIFT + HARDIRQ_BITS)
++#define PIPELINE_SHIFT	(NMI_SHIFT + NMI_BITS)
++#define STAGE_SHIFT	(PIPELINE_SHIFT + PIPELINE_BITS)
+ 
+ #define __IRQ_MASK(x)	((1UL << (x))-1)
+ 
+@@ -45,11 +51,15 @@
+ #define SOFTIRQ_MASK	(__IRQ_MASK(SOFTIRQ_BITS) << SOFTIRQ_SHIFT)
+ #define HARDIRQ_MASK	(__IRQ_MASK(HARDIRQ_BITS) << HARDIRQ_SHIFT)
+ #define NMI_MASK	(__IRQ_MASK(NMI_BITS)     << NMI_SHIFT)
++#define PIPELINE_MASK	(__IRQ_MASK(PIPELINE_BITS) << PIPELINE_SHIFT)
++#define STAGE_MASK	(__IRQ_MASK(STAGE_BITS) << STAGE_SHIFT)
+ 
+ #define PREEMPT_OFFSET	(1UL << PREEMPT_SHIFT)
+ #define SOFTIRQ_OFFSET	(1UL << SOFTIRQ_SHIFT)
+ #define HARDIRQ_OFFSET	(1UL << HARDIRQ_SHIFT)
+ #define NMI_OFFSET	(1UL << NMI_SHIFT)
++#define PIPELINE_OFFSET	(1UL << PIPELINE_SHIFT)
++#define STAGE_OFFSET	(1UL << STAGE_SHIFT)
+ 
+ #define SOFTIRQ_DISABLE_OFFSET	(2 * SOFTIRQ_OFFSET)
+ 
+@@ -82,6 +92,9 @@
+ #define irq_count()	(preempt_count() & (HARDIRQ_MASK | SOFTIRQ_MASK \
+ 				 | NMI_MASK))
+ 
++/* The current IRQ stage level: 0=inband, 1=oob */
++#define stage_level()	((preempt_count() & STAGE_MASK) >> STAGE_SHIFT)
++
+ /*
+  * Are we doing bottom half or hardware interrupt processing?
+  *
+@@ -91,6 +104,7 @@
+  * in_serving_softirq() - We're in softirq context
+  * in_nmi()       - We're in NMI context
+  * in_task()	  - We're in task context
++ * in_pipeline()  - We're on pipeline entry
+  *
+  * Note: due to the BH disabled confusion: in_softirq(),in_interrupt() really
+  *       should not be used in new code.
+@@ -102,6 +116,7 @@
+ #define in_nmi()		(preempt_count() & NMI_MASK)
+ #define in_task()		(!(preempt_count() & \
+ 				   (NMI_MASK | HARDIRQ_MASK | SOFTIRQ_OFFSET)))
++#define in_pipeline()		(preempt_count() & PIPELINE_MASK)
+ 
+ /*
+  * The preempt_count offset after preempt_disable();
+@@ -180,7 +195,8 @@ do { \
+ 
+ #define preempt_enable_no_resched() sched_preempt_enable_no_resched()
+ 
+-#define preemptible()	(preempt_count() == 0 && !irqs_disabled())
++#define preemptible()	(preempt_count() == 0 && \
++			 !hard_irqs_disabled() && !irqs_disabled())
+ 
+ #ifdef CONFIG_PREEMPTION
+ #define preempt_enable() \
+@@ -352,4 +368,43 @@ static __always_inline void migrate_enable(void)
+ 	preempt_enable();
+ }
+ 
++#ifdef CONFIG_IRQ_PIPELINE
++
++static __always_inline bool running_inband(void)
++{
++	return stage_level() == 0;
++}
++
++static __always_inline bool running_oob(void)
++{
++	return !running_inband();
++}
++
++unsigned long hard_preempt_disable(void);
++void hard_preempt_enable(unsigned long flags);
++
++#else
++
++static __always_inline bool running_inband(void)
++{
++	return true;
++}
++
++static __always_inline bool running_oob(void)
++{
++	return false;
++}
++
++#define hard_preempt_disable()		\
++({					\
++	preempt_disable();		\
++	0;				\
++})
++#define hard_preempt_enable(__flags)	\
++	do {				\
++		preempt_enable();	\
++		(void)(__flags);	\
++	} while (0)
++#endif
++
+ #endif /* __LINUX_PREEMPT_H */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index b055c217e..6614ce695 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1031,6 +1031,10 @@ struct task_struct {
+ 	int				irq_config;
+ #endif
+ 
++#ifdef CONFIG_IRQ_PIPELINE
++	unsigned long			stall_bits;
++#endif
++
+ #ifdef CONFIG_LOCKDEP
+ # define MAX_LOCK_DEPTH			48UL
+ 	u64				curr_chain_key;
+diff --git a/include/linux/smp.h b/include/linux/smp.h
+index 04f44e0aa..3147a2c76 100644
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@ -239,6 +239,21 @@ static inline int get_boot_cpu_id(void)
+ #define get_cpu()		({ preempt_disable(); __smp_processor_id(); })
+ #define put_cpu()		preempt_enable()
+ 
++#ifdef CONFIG_IRQ_PIPELINE
++#define hard_get_cpu(flags)	({			\
++		(flags) = hard_preempt_disable();	\
++		raw_smp_processor_id();			\
++	})
++#define hard_put_cpu(flags)	hard_preempt_enable(flags)
++#else
++#define hard_get_cpu(flags)	({ (void)(flags); get_cpu(); })
++#define hard_put_cpu(flags)	\
++	do {			\
++		(void)(flags);	\
++		put_cpu();	\
++	} while (0)
++#endif
++
+ /*
+  * Callback to arch code if there's nosmp or maxcpus=0 on the
+  * boot command line:
+diff --git a/include/linux/spinlock.h b/include/linux/spinlock.h
+index 79897841a..311854fe4 100644
+--- a/include/linux/spinlock.h
++++ b/include/linux/spinlock.h
+@@ -97,21 +97,27 @@
+ 				   struct lock_class_key *key, short inner);
+ 
+ # define raw_spin_lock_init(lock)					\
++	LOCK_ALTERNATIVES(lock,	spin_lock_init,				\
+ do {									\
+ 	static struct lock_class_key __key;				\
+ 									\
+-	__raw_spin_lock_init((lock), #lock, &__key, LD_WAIT_SPIN);	\
+-} while (0)
++	__raw_spin_lock_init(__RAWLOCK(lock), #lock, &__key, LD_WAIT_SPIN); \
++} while (0))
+ 
+ #else
+ # define raw_spin_lock_init(lock)				\
+-	do { *(lock) = __RAW_SPIN_LOCK_UNLOCKED(lock); } while (0)
++	LOCK_ALTERNATIVES(lock,	spin_lock_init,			\
++	do { *(__RAWLOCK(lock)) = __RAW_SPIN_LOCK_UNLOCKED(__RAWLOCK(lock)); } while (0))
+ #endif
+ 
+-#define raw_spin_is_locked(lock)	arch_spin_is_locked(&(lock)->raw_lock)
++#define raw_spin_is_locked(lock)		\
++	LOCK_ALTERNATIVES_RET(lock, spin_is_locked,	\
++	      arch_spin_is_locked(&(__RAWLOCK(lock))->raw_lock))
+ 
+ #ifdef arch_spin_is_contended
+-#define raw_spin_is_contended(lock)	arch_spin_is_contended(&(lock)->raw_lock)
++#define raw_spin_is_contended(lock)			\
++	LOCK_ALTERNATIVES_RET(lock, spin_is_contended,	\
++	      arch_spin_is_contended(&(__RAWLOCK(lock))->raw_lock))
+ #else
+ #define raw_spin_is_contended(lock)	(((void)(lock), 0))
+ #endif /*arch_spin_is_contended*/
+@@ -220,13 +226,19 @@ static inline void do_raw_spin_unlock(raw_spinlock_t *lock) __releases(lock)
+  * various methods are defined as nops in the case they are not
+  * required.
+  */
+-#define raw_spin_trylock(lock)	__cond_lock(lock, _raw_spin_trylock(lock))
++#define raw_spin_trylock(lock)			\
++	__cond_lock(lock,			\
++		    LOCK_ALTERNATIVES_RET(lock,	\
++		    spin_trylock, _raw_spin_trylock(__RAWLOCK(lock))))
+ 
+-#define raw_spin_lock(lock)	_raw_spin_lock(lock)
++#define raw_spin_lock(lock)	\
++	LOCK_ALTERNATIVES(lock, spin_lock, _raw_spin_lock(__RAWLOCK(lock)))
+ 
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++
+ # define raw_spin_lock_nested(lock, subclass) \
+-	_raw_spin_lock_nested(lock, subclass)
++	LOCK_ALTERNATIVES(lock, spin_lock_nested, \
++		_raw_spin_lock_nested(__RAWLOCK(lock), subclass), subclass)
+ 
+ # define raw_spin_lock_nest_lock(lock, nest_lock)			\
+ 	 do {								\
+@@ -239,18 +251,20 @@ static inline void do_raw_spin_unlock(raw_spinlock_t *lock) __releases(lock)
+  * warns about set-but-not-used variables when building with
+  * CONFIG_DEBUG_LOCK_ALLOC=n and with W=1.
+  */
+-# define raw_spin_lock_nested(lock, subclass)		\
+-	_raw_spin_lock(((void)(subclass), (lock)))
++# define raw_spin_lock_nested(lock, subclass)	\
++	LOCK_ALTERNATIVES(lock, spin_lock_nested, \
++		_raw_spin_lock(((void)(subclass), __RAWLOCK(lock))), subclass)
+ # define raw_spin_lock_nest_lock(lock, nest_lock)	_raw_spin_lock(lock)
+ #endif
+ 
+ #if defined(CONFIG_SMP) || defined(CONFIG_DEBUG_SPINLOCK)
+ 
+-#define raw_spin_lock_irqsave(lock, flags)			\
+-	do {						\
+-		typecheck(unsigned long, flags);	\
+-		flags = _raw_spin_lock_irqsave(lock);	\
+-	} while (0)
++#define raw_spin_lock_irqsave(lock, flags)				\
++	LOCK_ALTERNATIVES(lock, spin_lock_irqsave,			\
++	do {								\
++		typecheck(unsigned long, flags);			\
++		flags = _raw_spin_lock_irqsave(__RAWLOCK(lock));	\
++	} while (0), flags)
+ 
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ #define raw_spin_lock_irqsave_nested(lock, flags, subclass)		\
+@@ -268,45 +282,55 @@ static inline void do_raw_spin_unlock(raw_spinlock_t *lock) __releases(lock)
+ 
+ #else
+ 
+-#define raw_spin_lock_irqsave(lock, flags)		\
+-	do {						\
+-		typecheck(unsigned long, flags);	\
+-		_raw_spin_lock_irqsave(lock, flags);	\
+-	} while (0)
++#define raw_spin_lock_irqsave(lock, flags)			\
++	LOCK_ALTERNATIVES(lock, spin_lock_irqsave,		\
++	do {							\
++		typecheck(unsigned long, flags);		\
++		_raw_spin_lock_irqsave(__RAWLOCK(lock), flags);	\
++	} while (0), flags)
+ 
+ #define raw_spin_lock_irqsave_nested(lock, flags, subclass)	\
+ 	raw_spin_lock_irqsave(lock, flags)
+ 
+ #endif
+ 
+-#define raw_spin_lock_irq(lock)		_raw_spin_lock_irq(lock)
++#define raw_spin_lock_irq(lock)		       \
++	LOCK_ALTERNATIVES(lock, spin_lock_irq, \
++			  _raw_spin_lock_irq(__RAWLOCK(lock)))
+ #define raw_spin_lock_bh(lock)		_raw_spin_lock_bh(lock)
+-#define raw_spin_unlock(lock)		_raw_spin_unlock(lock)
+-#define raw_spin_unlock_irq(lock)	_raw_spin_unlock_irq(lock)
+-
+-#define raw_spin_unlock_irqrestore(lock, flags)		\
+-	do {							\
+-		typecheck(unsigned long, flags);		\
+-		_raw_spin_unlock_irqrestore(lock, flags);	\
+-	} while (0)
++#define raw_spin_unlock(lock)		     \
++	LOCK_ALTERNATIVES(lock, spin_unlock, \
++			  _raw_spin_unlock(__RAWLOCK(lock)))
++#define raw_spin_unlock_irq(lock)	\
++	LOCK_ALTERNATIVES(lock, spin_unlock_irq, \
++			  _raw_spin_unlock_irq(__RAWLOCK(lock)))
++
++#define raw_spin_unlock_irqrestore(lock, flags)				\
++	LOCK_ALTERNATIVES(lock, spin_unlock_irqrestore,			\
++	do {								\
++		typecheck(unsigned long, flags);			\
++		_raw_spin_unlock_irqrestore(__RAWLOCK(lock), flags);	\
++	} while (0), flags)
+ #define raw_spin_unlock_bh(lock)	_raw_spin_unlock_bh(lock)
+ 
+ #define raw_spin_trylock_bh(lock) \
+ 	__cond_lock(lock, _raw_spin_trylock_bh(lock))
+ 
+ #define raw_spin_trylock_irq(lock) \
++	LOCK_ALTERNATIVES_RET(lock, spin_trylock_irq, \
+ ({ \
+ 	local_irq_disable(); \
+-	raw_spin_trylock(lock) ? \
++	raw_spin_trylock(__RAWLOCK(lock)) ?	\
+ 	1 : ({ local_irq_enable(); 0;  }); \
+-})
++}))
+ 
+ #define raw_spin_trylock_irqsave(lock, flags) \
++	LOCK_ALTERNATIVES_RET(lock, spin_trylock_irqsave, \
+ ({ \
+ 	local_irq_save(flags); \
+-	raw_spin_trylock(lock) ? \
++	raw_spin_trylock(__RAWLOCK(lock)) ?	\
+ 	1 : ({ local_irq_restore(flags); 0; }); \
+-})
++}), flags)
+ 
+ /* Include rwlock functions */
+ #include <linux/rwlock.h>
+@@ -320,12 +344,20 @@ static inline void do_raw_spin_unlock(raw_spinlock_t *lock) __releases(lock)
+ # include <linux/spinlock_api_up.h>
+ #endif
+ 
++/* Pull the lock types specific to the IRQ pipeline. */
++#ifdef CONFIG_IRQ_PIPELINE
++#include <linux/spinlock_pipeline.h>
++#else
++static inline void check_spinlock_context(void) { }
++#endif
++
+ /*
+  * Map the spin_lock functions to the raw variants for PREEMPT_RT=n
+  */
+ 
+ static __always_inline raw_spinlock_t *spinlock_check(spinlock_t *lock)
+ {
++	check_spinlock_context();
+ 	return &lock->rlock;
+ }
+ 
+diff --git a/include/linux/spinlock_api_up.h b/include/linux/spinlock_api_up.h
+index d0d188861..6895779e8 100644
+--- a/include/linux/spinlock_api_up.h
++++ b/include/linux/spinlock_api_up.h
+@@ -30,21 +30,33 @@
+ #define __LOCK(lock) \
+   do { preempt_disable(); ___LOCK(lock); } while (0)
+ 
++#define __HARD_LOCK(lock) \
++  do { ___LOCK(lock); } while (0)
++
+ #define __LOCK_BH(lock) \
+   do { __local_bh_disable_ip(_THIS_IP_, SOFTIRQ_LOCK_OFFSET); ___LOCK(lock); } while (0)
+ 
+ #define __LOCK_IRQ(lock) \
+   do { local_irq_disable(); __LOCK(lock); } while (0)
+ 
++#define __HARD_LOCK_IRQ(lock) \
++  do { hard_local_irq_disable(); __HARD_LOCK(lock); } while (0)
++
+ #define __LOCK_IRQSAVE(lock, flags) \
+   do { local_irq_save(flags); __LOCK(lock); } while (0)
+ 
++#define __HARD_LOCK_IRQSAVE(lock, flags) \
++  do { flags = hard_local_irq_save(); __HARD_LOCK(lock); } while (0)
++
+ #define ___UNLOCK(lock) \
+   do { __release(lock); (void)(lock); } while (0)
+ 
+ #define __UNLOCK(lock) \
+   do { preempt_enable(); ___UNLOCK(lock); } while (0)
+ 
++#define __HARD_UNLOCK(lock) \
++  do { ___UNLOCK(lock); } while (0)
++
+ #define __UNLOCK_BH(lock) \
+   do { __local_bh_enable_ip(_THIS_IP_, SOFTIRQ_LOCK_OFFSET); \
+        ___UNLOCK(lock); } while (0)
+@@ -52,9 +64,15 @@
+ #define __UNLOCK_IRQ(lock) \
+   do { local_irq_enable(); __UNLOCK(lock); } while (0)
+ 
++#define __HARD_UNLOCK_IRQ(lock) \
++  do { hard_local_irq_enable(); __HARD_UNLOCK(lock); } while (0)
++
+ #define __UNLOCK_IRQRESTORE(lock, flags) \
+   do { local_irq_restore(flags); __UNLOCK(lock); } while (0)
+ 
++#define __HARD_UNLOCK_IRQRESTORE(lock, flags) \
++  do { hard_local_irq_restore(flags); __HARD_UNLOCK(lock); } while (0)
++
+ #define _raw_spin_lock(lock)			__LOCK(lock)
+ #define _raw_spin_lock_nested(lock, subclass)	__LOCK(lock)
+ #define _raw_read_lock(lock)			__LOCK(lock)
+diff --git a/include/linux/spinlock_pipeline.h b/include/linux/spinlock_pipeline.h
+new file mode 100644
+index 000000000..6407bc44e
+--- /dev/null
++++ b/include/linux/spinlock_pipeline.h
+@@ -0,0 +1,361 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright (C) 2016 Philippe Gerum  <rpm@xenomai.org>.
++ */
++#ifndef __LINUX_SPINLOCK_PIPELINE_H
++#define __LINUX_SPINLOCK_PIPELINE_H
++
++#ifndef __LINUX_SPINLOCK_H
++# error "Please don't include this file directly. Use spinlock.h."
++#endif
++
++#define hard_spin_lock_irqsave(__rlock, __flags)		\
++	do {							\
++		(__flags) = __hard_spin_lock_irqsave(__rlock);	\
++	} while (0)
++
++#define hard_spin_trylock_irqsave(__rlock, __flags)			\
++	({								\
++		int __locked;						\
++		(__flags) = __hard_spin_trylock_irqsave(__rlock, &__locked); \
++		__locked;						\
++	})
++
++#define hybrid_spin_lock_init(__rlock)	hard_spin_lock_init(__rlock)
++
++/*
++ * CAUTION: We don't want the hand-coded irq-enable of
++ * do_raw_spin_lock_flags(), hard locked sections assume that
++ * interrupts are not re-enabled during lock-acquire.
++ */
++#define hard_lock_acquire(__rlock, __try, __ip)				\
++	do {								\
++		if (irq_pipeline_debug_locking()) {			\
++			spin_acquire(&(__rlock)->dep_map, 0, __try, __ip); \
++			LOCK_CONTENDED(__rlock, do_raw_spin_trylock, do_raw_spin_lock); \
++		} else							\
++			do_raw_spin_lock(__rlock);			\
++	} while (0)
++
++#define hard_lock_acquire_nested(__rlock, __subclass, __ip)		\
++	do {								\
++		if (irq_pipeline_debug_locking()) {			\
++			spin_acquire(&(__rlock)->dep_map, __subclass, 0, __ip); \
++			LOCK_CONTENDED(__rlock, do_raw_spin_trylock, do_raw_spin_lock); \
++		} else							\
++			do_raw_spin_lock(__rlock);			\
++	} while (0)
++
++#define hard_trylock_acquire(__rlock, __try, __ip)			\
++	do {								\
++		if (irq_pipeline_debug_locking())			\
++			spin_acquire(&(__rlock)->dep_map, 0, __try, __ip); \
++	} while (0)
++
++#define hard_lock_release(__rlock, __ip)				\
++	do {								\
++		if (irq_pipeline_debug_locking())			\
++			spin_release(&(__rlock)->dep_map, __ip);	\
++		do_raw_spin_unlock(__rlock);				\
++	} while (0)
++
++#if defined(CONFIG_SMP) || defined(CONFIG_DEBUG_SPINLOCK)
++
++#ifdef CONFIG_DEBUG_SPINLOCK
++#define hard_spin_lock_init(__lock)				\
++	do {							\
++		static struct lock_class_key __key;		\
++		__raw_spin_lock_init((raw_spinlock_t *)__lock, #__lock, &__key, LD_WAIT_SPIN); \
++	} while (0)
++#else
++#define hard_spin_lock_init(__rlock)				\
++	do { *(__rlock) = __HARD_SPIN_LOCK_UNLOCKED(__rlock); } while (0)
++#endif
++
++/*
++ * XXX: no preempt_enable/disable when hard locking.
++ */
++
++static inline
++void hard_spin_lock(struct raw_spinlock *rlock)
++{
++	hard_lock_acquire(rlock, 0, _THIS_IP_);
++}
++
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++static inline
++void hard_spin_lock_nested(struct raw_spinlock *rlock, int subclass)
++{
++	hard_lock_acquire_nested(rlock, subclass, _THIS_IP_);
++}
++#else
++static inline
++void hard_spin_lock_nested(struct raw_spinlock *rlock, int subclass)
++{
++	hard_spin_lock(rlock);
++}
++#endif
++
++static inline
++void hard_spin_unlock(struct raw_spinlock *rlock)
++{
++	hard_lock_release(rlock, _THIS_IP_);
++}
++
++static inline
++void hard_spin_lock_irq(struct raw_spinlock *rlock)
++{
++	hard_local_irq_disable();
++	hard_lock_acquire(rlock, 0, _THIS_IP_);
++}
++
++static inline
++void hard_spin_unlock_irq(struct raw_spinlock *rlock)
++{
++	hard_lock_release(rlock, _THIS_IP_);
++	hard_local_irq_enable();
++}
++
++static inline
++void hard_spin_unlock_irqrestore(struct raw_spinlock *rlock,
++				 unsigned long flags)
++{
++	hard_lock_release(rlock, _THIS_IP_);
++	hard_local_irq_restore(flags);
++}
++
++static inline
++unsigned long __hard_spin_lock_irqsave(struct raw_spinlock *rlock)
++{
++	unsigned long flags = hard_local_irq_save();
++
++	hard_lock_acquire(rlock, 0, _THIS_IP_);
++
++	return flags;
++}
++
++static inline
++int hard_spin_trylock(struct raw_spinlock *rlock)
++{
++	if (do_raw_spin_trylock(rlock)) {
++		hard_trylock_acquire(rlock, 1, _THIS_IP_);
++		return 1;
++	}
++	return 0;
++}
++
++static inline
++unsigned long __hard_spin_trylock_irqsave(struct raw_spinlock *rlock,
++					  int *locked)
++{
++	unsigned long flags = hard_local_irq_save();
++	*locked = hard_spin_trylock(rlock);
++	return *locked ? flags : ({ hard_local_irq_restore(flags); flags; });
++}
++
++static inline
++int hard_spin_trylock_irq(struct raw_spinlock *rlock)
++{
++	hard_local_irq_disable();
++	return hard_spin_trylock(rlock) ? : ({ hard_local_irq_enable(); 0; });
++}
++
++static inline
++int hard_spin_is_locked(struct raw_spinlock *rlock)
++{
++	return arch_spin_is_locked(&rlock->raw_lock);
++}
++
++static inline
++int hard_spin_is_contended(struct raw_spinlock *rlock)
++{
++#ifdef CONFIG_GENERIC_LOCKBREAK
++	return rlock->break_lock;
++#elif defined(arch_spin_is_contended)
++	return arch_spin_is_contended(&rlock->raw_lock);
++#else
++	return 0;
++#endif
++}
++
++#else  /* !SMP && !DEBUG_SPINLOCK */
++
++#define hard_spin_lock_init(__rlock)	do { (void)(__rlock); } while (0)
++#define hard_spin_lock(__rlock)		__HARD_LOCK(__rlock)
++#define hard_spin_lock_nested(__rlock, __subclass)  \
++	do { __HARD_LOCK(__rlock); (void)(__subclass); } while (0)
++#define hard_spin_unlock(__rlock)	__HARD_UNLOCK(__rlock)
++#define hard_spin_lock_irq(__rlock)	__HARD_LOCK_IRQ(__rlock)
++#define hard_spin_unlock_irq(__rlock)	__HARD_UNLOCK_IRQ(__rlock)
++#define hard_spin_unlock_irqrestore(__rlock, __flags)	\
++	__HARD_UNLOCK_IRQRESTORE(__rlock, __flags)
++#define __hard_spin_lock_irqsave(__rlock)		\
++	({						\
++		unsigned long __flags;			\
++		__HARD_LOCK_IRQSAVE(__rlock, __flags);	\
++		__flags;				\
++	})
++#define __hard_spin_trylock_irqsave(__rlock, __locked)	\
++	({						\
++		unsigned long __flags;			\
++		__HARD_LOCK_IRQSAVE(__rlock, __flags);	\
++		*(__locked) = 1;			\
++		__flags;				\
++	})
++#define hard_spin_trylock(__rlock)	({ __HARD_LOCK(__rlock); 1; })
++#define hard_spin_trylock_irq(__rlock)	({ __HARD_LOCK_IRQ(__rlock); 1; })
++#define hard_spin_is_locked(__rlock)	((void)(__rlock), 0)
++#define hard_spin_is_contended(__rlock)	((void)(__rlock), 0)
++#endif	/* !SMP && !DEBUG_SPINLOCK */
++
++/*
++ * In the pipeline entry context, the regular preemption and root
++ * stall logic do not apply since we may actually have preempted any
++ * critical section of the kernel which is protected by regular
++ * locking (spin or stall), or we may even have preempted the head
++ * stage. Therefore, we just need to grab the raw spinlock underlying
++ * a hybrid spinlock to exclude other CPUs.
++ *
++ * NOTE: When entering the pipeline, IRQs are already hard disabled.
++ */
++
++void __hybrid_spin_lock(struct raw_spinlock *rlock);
++void __hybrid_spin_lock_nested(struct raw_spinlock *rlock, int subclass);
++
++static inline void hybrid_spin_lock(struct raw_spinlock *rlock)
++{
++	if (in_pipeline())
++		hard_lock_acquire(rlock, 0, _THIS_IP_);
++	else
++		__hybrid_spin_lock(rlock);
++}
++
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++static inline
++void hybrid_spin_lock_nested(struct raw_spinlock *rlock, int subclass)
++{
++	if (in_pipeline())
++		hard_lock_acquire_nested(rlock, subclass, _THIS_IP_);
++	else
++		__hybrid_spin_lock_nested(rlock, subclass);
++}
++#else
++static inline
++void hybrid_spin_lock_nested(struct raw_spinlock *rlock, int subclass)
++{
++	hybrid_spin_lock(rlock);
++}
++#endif
++
++void __hybrid_spin_unlock(struct raw_spinlock *rlock);
++
++static inline void hybrid_spin_unlock(struct raw_spinlock *rlock)
++{
++	if (in_pipeline())
++		hard_lock_release(rlock, _THIS_IP_);
++	else
++		__hybrid_spin_unlock(rlock);
++}
++
++void __hybrid_spin_lock_irq(struct raw_spinlock *rlock);
++
++static inline void hybrid_spin_lock_irq(struct raw_spinlock *rlock)
++{
++	if (in_pipeline())
++		hard_lock_acquire(rlock, 0, _THIS_IP_);
++	else
++		__hybrid_spin_lock_irq(rlock);
++}
++
++void __hybrid_spin_unlock_irq(struct raw_spinlock *rlock);
++
++static inline void hybrid_spin_unlock_irq(struct raw_spinlock *rlock)
++{
++	if (in_pipeline())
++		hard_lock_release(rlock, _THIS_IP_);
++	else
++		__hybrid_spin_unlock_irq(rlock);
++}
++
++unsigned long __hybrid_spin_lock_irqsave(struct raw_spinlock *rlock);
++
++#define hybrid_spin_lock_irqsave(__rlock, __flags)			\
++	do {								\
++		if (in_pipeline()) {					\
++			hard_lock_acquire(__rlock, 0, _THIS_IP_);	\
++			(__flags) = hard_local_save_flags();		\
++		} else							\
++			(__flags) = __hybrid_spin_lock_irqsave(__rlock); \
++	} while (0)
++
++void __hybrid_spin_unlock_irqrestore(struct raw_spinlock *rlock,
++				      unsigned long flags);
++
++static inline void hybrid_spin_unlock_irqrestore(struct raw_spinlock *rlock,
++						  unsigned long flags)
++{
++
++	if (in_pipeline())
++		hard_lock_release(rlock, _THIS_IP_);
++	else
++		__hybrid_spin_unlock_irqrestore(rlock, flags);
++}
++
++int __hybrid_spin_trylock(struct raw_spinlock *rlock);
++
++static inline int hybrid_spin_trylock(struct raw_spinlock *rlock)
++{
++	if (in_pipeline()) {
++		if (do_raw_spin_trylock(rlock)) {
++			hard_trylock_acquire(rlock, 1, _THIS_IP_);
++			return 1;
++		}
++		return 0;
++	}
++
++	return __hybrid_spin_trylock(rlock);
++}
++
++int __hybrid_spin_trylock_irqsave(struct raw_spinlock *rlock,
++				   unsigned long *flags);
++
++#define hybrid_spin_trylock_irqsave(__rlock, __flags)			\
++	({								\
++		int __ret = 1;						\
++		if (in_pipeline()) {					\
++			if (do_raw_spin_trylock(__rlock)) {		\
++				hard_trylock_acquire(__rlock, 1, _THIS_IP_); \
++				(__flags) = hard_local_save_flags();	\
++			} else						\
++				__ret = 0;				\
++		} else							\
++			__ret = __hybrid_spin_trylock_irqsave(__rlock, &(__flags)); \
++		__ret;							\
++	})
++
++static inline int hybrid_spin_trylock_irq(struct raw_spinlock *rlock)
++{
++	unsigned long flags;
++	return hybrid_spin_trylock_irqsave(rlock, flags);
++}
++
++static inline
++int hybrid_spin_is_locked(struct raw_spinlock *rlock)
++{
++	return hard_spin_is_locked(rlock);
++}
++
++static inline
++int hybrid_spin_is_contended(struct raw_spinlock *rlock)
++{
++	return hard_spin_is_contended(rlock);
++}
++
++#ifdef CONFIG_DEBUG_IRQ_PIPELINE
++void check_spinlock_context(void);
++#else
++static inline void check_spinlock_context(void) { }
++#endif
++
++#endif /* __LINUX_SPINLOCK_PIPELINE_H */
+diff --git a/include/linux/spinlock_types.h b/include/linux/spinlock_types.h
+index b981caafe..202733816 100644
+--- a/include/linux/spinlock_types.h
++++ b/include/linux/spinlock_types.h
+@@ -96,6 +96,152 @@ typedef struct spinlock {
+ 
+ #define DEFINE_SPINLOCK(x)	spinlock_t x = __SPIN_LOCK_UNLOCKED(x)
+ 
++#ifdef CONFIG_IRQ_PIPELINE
++
++void __bad_spinlock_type(void);
++
++#define __RAWLOCK(x) ((struct raw_spinlock *)(x))
++
++#define LOCK_ALTERNATIVES(__lock, __base_op, __raw_form, __args...)	\
++	do {								\
++		if (__builtin_types_compatible_p(typeof(__lock),	\
++						 raw_spinlock_t *))	\
++			__raw_form;					\
++		else if (__builtin_types_compatible_p(typeof(__lock),	\
++						 hard_spinlock_t *))	\
++			hard_ ## __base_op(__RAWLOCK(__lock), ##__args); \
++		else if (__builtin_types_compatible_p(typeof(__lock),	\
++						 hybrid_spinlock_t *))	\
++			hybrid_ ## __base_op(__RAWLOCK(__lock), ##__args); \
++		else							\
++			__bad_spinlock_type();				\
++	} while (0)
++
++#define LOCK_ALTERNATIVES_RET(__lock, __base_op, __raw_form, __args...) \
++	({								\
++		long __ret = 0;						\
++		if (__builtin_types_compatible_p(typeof(__lock),	\
++						 raw_spinlock_t *))	\
++			__ret = __raw_form;				\
++		else if (__builtin_types_compatible_p(typeof(__lock),	\
++						 hard_spinlock_t *))	\
++			__ret = hard_ ## __base_op(__RAWLOCK(__lock), ##__args); \
++		else if (__builtin_types_compatible_p(typeof(__lock),	\
++						 hybrid_spinlock_t *))	\
++			__ret = hybrid_ ## __base_op(__RAWLOCK(__lock), ##__args); \
++		else							\
++			__bad_spinlock_type();				\
++		__ret;							\
++	})
++
++#define LOCKDEP_ALT_DEPMAP(__lock)					\
++	({								\
++		struct lockdep_map *__ret;				\
++		if (__builtin_types_compatible_p(typeof(&(__lock)->dep_map), \
++						 struct phony_lockdep_map *)) \
++			__ret = &__RAWLOCK(__lock)->dep_map;		\
++		else							\
++			__ret = (struct lockdep_map *)(&(__lock)->dep_map); \
++		__ret;							\
++	})
++
++#define LOCKDEP_HARD_DEBUG(__lock, __nodebug, __debug)	\
++	do {						\
++		if (__builtin_types_compatible_p(typeof(__lock),	\
++						raw_spinlock_t *) ||	\
++			irq_pipeline_debug_locking()) {			\
++			__debug;			\
++		} else {				\
++			__nodebug;			\
++		}					\
++	} while (0)
++
++#define LOCKDEP_HARD_DEBUG_RET(__lock, __nodebug, __debug)	\
++	({						\
++		typeof(__nodebug) __ret;		\
++		if (__builtin_types_compatible_p(typeof(__lock),	\
++						raw_spinlock_t *) ||	\
++			irq_pipeline_debug_locking()) {			\
++			__ret = (__debug);		\
++		} else {				\
++			__ret = (__nodebug);		\
++		}					\
++		__ret;					\
++	})
++
++#define __HARD_SPIN_LOCK_UNLOCKED(__rlock)	\
++	__RAW_SPIN_LOCK_UNLOCKED(__rlock)
++
++#define __HARD_SPIN_LOCK_INITIALIZER(__lock)				\
++	{								\
++		.rlock = __HARD_SPIN_LOCK_UNLOCKED((__lock).rlock),	\
++	}
++
++#define DEFINE_HARD_SPINLOCK(x)	hard_spinlock_t x = {	\
++		.rlock = __HARD_SPIN_LOCK_UNLOCKED(x),	\
++	}
++
++#define DECLARE_HARD_SPINLOCK(x)	hard_spinlock_t x
++
++struct phony_lockdep_map {
++	u8 wait_type_outer;
++	u8 wait_type_inner;
++  	u8 lock_type;
++};
++
++typedef struct hard_spinlock {
++	/* XXX: offset_of(struct hard_spinlock, rlock) == 0 */
++	struct raw_spinlock rlock;
++	struct phony_lockdep_map dep_map;
++} hard_spinlock_t;
++
++#define DEFINE_MUTABLE_SPINLOCK(x)	hybrid_spinlock_t x = {	\
++		.rlock = __RAW_SPIN_LOCK_UNLOCKED(x),			\
++	}
++
++#define DECLARE_MUTABLE_SPINLOCK(x)	hybrid_spinlock_t x
++
++typedef struct hybrid_spinlock {
++	/* XXX: offset_of(struct hybrid_spinlock, rlock) == 0 */
++	struct raw_spinlock rlock;
++	unsigned long hwflags;
++	struct phony_lockdep_map dep_map;
++} hybrid_spinlock_t;
++
++#else
++
++typedef raw_spinlock_t hard_spinlock_t;
++
++typedef raw_spinlock_t hybrid_spinlock_t;
++
++#define LOCK_ALTERNATIVES(__lock, __base_op, __raw_form, __args...)	\
++	__raw_form
++
++#define LOCK_ALTERNATIVES_RET(__lock, __base_op, __raw_form, __args...) \
++	__raw_form
++
++#define LOCKDEP_ALT_DEPMAP(__lock)	(&(__lock)->dep_map)
++
++#define LOCKDEP_HARD_DEBUG(__lock, __nondebug, __debug)		do { __debug; } while (0)
++
++#define LOCKDEP_HARD_DEBUG_RET(__lock, __nondebug, __debug)	({ __debug; })
++
++#define DEFINE_HARD_SPINLOCK(x)		DEFINE_RAW_SPINLOCK(x)
++
++#define DECLARE_HARD_SPINLOCK(x)	raw_spinlock_t x
++
++#define DEFINE_MUTABLE_SPINLOCK(x)	DEFINE_RAW_SPINLOCK(x)
++
++#define DECLARE_MUTABLE_SPINLOCK(x)	raw_spinlock_t x
++
++#define __RAWLOCK(x) (x)
++
++#define __HARD_SPIN_LOCK_UNLOCKED(__lock)	__RAW_SPIN_LOCK_UNLOCKED(__lock)
++
++#define __HARD_SPIN_LOCK_INITIALIZER(__lock)	__RAW_SPIN_LOCK_UNLOCKED(__lock)
++
++#endif	/* CONFIG_IRQ_PIPELINE */
++
+ #include <linux/rwlock_types.h>
+ 
+ #endif /* __LINUX_SPINLOCK_TYPES_H */
+diff --git a/include/linux/thread_info.h b/include/linux/thread_info.h
+index aa9e80160..83187b9e5 100644
+--- a/include/linux/thread_info.h
++++ b/include/linux/thread_info.h
+@@ -175,17 +175,18 @@ static inline void arch_setup_new_exec(void) { }
+  * If the arch defines a set of per-thread synchronous flags, provide
+  * generic accessors to them.
+  */
+-static inline void set_ti_local_flags(struct thread_info *ti, unsigned int mask)
++static __always_inline
++void set_ti_local_flags(struct thread_info *ti, unsigned int mask)
+ {
+ 	ti_local_flags(ti) |= mask;
+ }
+ 
+-static inline void set_thread_local_flags(unsigned int mask)
++static __always_inline void set_thread_local_flags(unsigned int mask)
+ {
+ 	set_ti_local_flags(current_thread_info(), mask);
+ }
+ 
+-static inline
++static __always_inline
+ int test_and_set_ti_local_flags(struct thread_info *ti, unsigned int mask)
+ {
+ 	int old = ti_local_flags(ti) & mask;
+@@ -193,18 +194,18 @@ int test_and_set_ti_local_flags(struct thread_info *ti, unsigned int mask)
+ 	return old != 0;
+ }
+ 
+-static inline int test_and_set_thread_local_flags(unsigned int mask)
++static __always_inline int test_and_set_thread_local_flags(unsigned int mask)
+ {
+ 	return test_and_set_ti_local_flags(current_thread_info(), mask);
+ }
+ 
+-static inline
++static __always_inline
+ void clear_ti_local_flags(struct thread_info *ti, unsigned int mask)
+ {
+ 	ti_local_flags(ti) &= ~mask;
+ }
+ 
+-static inline
++static __always_inline
+ int test_and_clear_ti_local_flags(struct thread_info *ti, unsigned int mask)
+ {
+ 	int old = ti_local_flags(ti) & mask;
+@@ -212,23 +213,23 @@ int test_and_clear_ti_local_flags(struct thread_info *ti, unsigned int mask)
+ 	return old != 0;
+ }
+ 
+-static inline int test_and_clear_thread_local_flags(unsigned int mask)
++static __always_inline int test_and_clear_thread_local_flags(unsigned int mask)
+ {
+ 	return test_and_clear_ti_local_flags(current_thread_info(), mask);
+ }
+ 
+-static inline void clear_thread_local_flags(unsigned int mask)
++static __always_inline void clear_thread_local_flags(unsigned int mask)
+ {
+ 	clear_ti_local_flags(current_thread_info(), mask);
+ }
+ 
+-static inline
++static __always_inline
+ bool test_ti_local_flags(struct thread_info *ti, unsigned int mask)
+ {
+ 	return (ti_local_flags(ti) & mask) != 0;
+ }
+ 
+-static inline bool test_thread_local_flags(unsigned int mask)
++static __always_inline bool test_thread_local_flags(unsigned int mask)
+ {
+ 	return test_ti_local_flags(current_thread_info(), mask);
+ }
+diff --git a/include/trace/events/irq.h b/include/trace/events/irq.h
+index eeceafaae..e76f462f5 100644
+--- a/include/trace/events/irq.h
++++ b/include/trace/events/irq.h
+@@ -100,6 +100,48 @@ TRACE_EVENT(irq_handler_exit,
+ 		  __entry->irq, __entry->ret ? "handled" : "unhandled")
+ );
+ 
++/**
++ * irq_pipeline_entry - called when an external irq enters the pipeline
++ * @irq: irq number
++ */
++TRACE_EVENT(irq_pipeline_entry,
++
++	TP_PROTO(int irq),
++
++	TP_ARGS(irq),
++
++	TP_STRUCT__entry(
++		__field(	int,	irq		)
++	),
++
++	TP_fast_assign(
++		__entry->irq = irq;
++	),
++
++	TP_printk("irq=%d", __entry->irq)
++);
++
++/**
++ * irq_pipeline_exit - called when an external irq leaves the pipeline
++ * @irq: irq number
++ */
++TRACE_EVENT(irq_pipeline_exit,
++
++	TP_PROTO(int irq),
++
++	TP_ARGS(irq),
++
++	TP_STRUCT__entry(
++		__field(	int,	irq		)
++	),
++
++	TP_fast_assign(
++		__entry->irq = irq;
++	),
++
++	TP_printk("irq=%d", __entry->irq)
++);
++
+ DECLARE_EVENT_CLASS(softirq,
+ 
+ 	TP_PROTO(unsigned int vec_nr),
+diff --git a/init/Makefile b/init/Makefile
+index 6bc37f64b..ce21edc2d 100644
+--- a/init/Makefile
++++ b/init/Makefile
+@@ -34,4 +34,4 @@ include/generated/compile.h: FORCE
+ 	@$($(quiet)chk_compile.h)
+ 	$(Q)$(CONFIG_SHELL) $(srctree)/scripts/mkcompile_h $@	\
+ 	"$(UTS_MACHINE)" "$(CONFIG_SMP)" "$(CONFIG_PREEMPT)"	\
+-	"$(CONFIG_PREEMPT_RT)" $(CONFIG_CC_VERSION_TEXT) "$(LD)"
++	"$(CONFIG_PREEMPT_RT)" "$(CONFIG_IRQ_PIPELINE)" $(CONFIG_CC_VERSION_TEXT) "$(LD)"
+diff --git a/init/main.c b/init/main.c
+index d8bfe61b5..94e93b9e1 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -51,6 +51,7 @@
+ #include <linux/tick.h>
+ #include <linux/sched/isolation.h>
+ #include <linux/interrupt.h>
++#include <linux/irq_pipeline.h>
+ #include <linux/taskstats_kern.h>
+ #include <linux/delayacct.h>
+ #include <linux/unistd.h>
+@@ -857,7 +858,7 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
+ 
+ 	cgroup_init_early();
+ 
+-	local_irq_disable();
++	local_irq_disable_full();
+ 	early_boot_irqs_disabled = true;
+ 
+ 	/*
+@@ -901,6 +902,7 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
+ 	setup_log_buf(0);
+ 	vfs_caches_init_early();
+ 	sort_main_extable();
++	irq_pipeline_init_early();
+ 	trap_init();
+ 	mm_init();
+ 
+@@ -946,6 +948,7 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
+ 	/* init some links before init_ISA_irqs() */
+ 	early_irq_init();
+ 	init_IRQ();
++	irq_pipeline_init();
+ 	tick_init();
+ 	rcu_init_nohz();
+ 	init_timers();
+@@ -970,7 +973,7 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
+ 	WARN(!irqs_disabled(), "Interrupts were enabled early\n");
+ 
+ 	early_boot_irqs_disabled = false;
+-	local_irq_enable();
++	local_irq_enable_full();
+ 
+ 	kmem_cache_init_late();
+ 
+diff --git a/kernel/irq/Kconfig b/kernel/irq/Kconfig
+index 0f2a44fc0..c1687a183 100644
+--- a/kernel/irq/Kconfig
++++ b/kernel/irq/Kconfig
+@@ -139,6 +139,19 @@ config GENERIC_IRQ_DEBUGFS
+ 
+ 	  If you don't know what to do here, say N.
+ 
++# Interrupt pipeline
++config HAVE_IRQ_PIPELINE
++	bool
++
++config IRQ_PIPELINE
++	bool "Interrupt pipeline"
++	depends on HAVE_IRQ_PIPELINE
++	select IRQ_DOMAIN
++	default n
++	help
++	  Activate this option if you want the interrupt pipeline to be
++	  compiled in.
++
+ endmenu
+ 
+ config GENERIC_IRQ_MULTI_HANDLER
+diff --git a/kernel/irq/Makefile b/kernel/irq/Makefile
+index b4f53717d..e37dd48cd 100644
+--- a/kernel/irq/Makefile
++++ b/kernel/irq/Makefile
+@@ -9,6 +9,7 @@ obj-$(CONFIG_GENERIC_IRQ_CHIP) += generic-chip.o
+ obj-$(CONFIG_GENERIC_IRQ_PROBE) += autoprobe.o
+ obj-$(CONFIG_IRQ_DOMAIN) += irqdomain.o
+ obj-$(CONFIG_IRQ_SIM) += irq_sim.o
++obj-$(CONFIG_IRQ_PIPELINE) += pipeline.o
+ obj-$(CONFIG_PROC_FS) += proc.o
+ obj-$(CONFIG_GENERIC_PENDING_IRQ) += migration.o
+ obj-$(CONFIG_GENERIC_IRQ_MIGRATION) += cpuhotplug.o
+diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
+index 621d8dd15..c3fc23ff2 100644
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@ -14,6 +14,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/kernel_stat.h>
+ #include <linux/irqdomain.h>
++#include <linux/irq_pipeline.h>
+ 
+ #include <trace/events/irq.h>
+ 
+@@ -48,6 +49,10 @@ int irq_set_chip(unsigned int irq, struct irq_chip *chip)
+ 
+ 	if (!chip)
+ 		chip = &no_irq_chip;
++	else
++		WARN_ONCE(irqs_pipelined() &&
++			  (chip->flags & IRQCHIP_PIPELINE_SAFE) == 0,
++			  "irqchip %s is not pipeline-safe!", chip->name);
+ 
+ 	desc->irq_data.chip = chip;
+ 	irq_put_desc_unlock(desc, flags);
+@@ -155,14 +160,6 @@ int irq_set_chip_data(unsigned int irq, void *data)
+ }
+ EXPORT_SYMBOL(irq_set_chip_data);
+ 
+-struct irq_data *irq_get_irq_data(unsigned int irq)
+-{
+-	struct irq_desc *desc = irq_to_desc(irq);
+-
+-	return desc ? &desc->irq_data : NULL;
+-}
+-EXPORT_SYMBOL_GPL(irq_get_irq_data);
+-
+ static void irq_state_clr_disabled(struct irq_desc *desc)
+ {
+ 	irqd_clear(&desc->irq_data, IRQD_IRQ_DISABLED);
+@@ -385,7 +382,8 @@ static void __irq_disable(struct irq_desc *desc, bool mask)
+  */
+ void irq_disable(struct irq_desc *desc)
+ {
+-	__irq_disable(desc, irq_settings_disable_unlazy(desc));
++	__irq_disable(desc,
++	      irq_settings_disable_unlazy(desc) || irqs_pipelined());
+ }
+ 
+ void irq_percpu_enable(struct irq_desc *desc, unsigned int cpu)
+@@ -517,8 +515,22 @@ static bool irq_may_run(struct irq_desc *desc)
+ 	 * If the interrupt is an armed wakeup source, mark it pending
+ 	 * and suspended, disable it and notify the pm core about the
+ 	 * event.
++	 *
++	 * When pipelining, the logic is as follows:
++	 *
++	 * - from a pipeline entry context, we might have preempted
++	 * the oob stage, or irqs might be [virtually] off, so we may
++	 * not run the in-band PM code. Just make sure any wakeup
++	 * interrupt is detected later on when the flow handler
++	 * re-runs from the in-band stage.
++	 *
++	 * - from the in-band context, run the PM wakeup check.
+ 	 */
+-	if (irq_pm_check_wakeup(desc))
++	if (irqs_pipelined()) {
++		WARN_ON_ONCE(irq_pipeline_debug() && !in_pipeline());
++		if (irqd_is_wakeup_armed(&desc->irq_data))
++			return true;
++	} else if (irq_pm_check_wakeup(desc))
+ 		return false;
+ 
+ 	/*
+@@ -542,8 +554,13 @@ void handle_simple_irq(struct irq_desc *desc)
+ {
+ 	raw_spin_lock(&desc->lock);
+ 
+-	if (!irq_may_run(desc))
++	if (start_irq_flow() && !irq_may_run(desc))
++		goto out_unlock;
++
++	if (on_pipeline_entry()) {
++		handle_oob_irq(desc);
+ 		goto out_unlock;
++	}
+ 
+ 	desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
+ 
+@@ -579,9 +596,14 @@ void handle_untracked_irq(struct irq_desc *desc)
+ 
+ 	raw_spin_lock(&desc->lock);
+ 
+-	if (!irq_may_run(desc))
++	if (start_irq_flow() && !irq_may_run(desc))
+ 		goto out_unlock;
+ 
++	if (on_pipeline_entry()) {
++		handle_oob_irq(desc);
++		goto out_unlock;
++	}
++
+ 	desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
+ 
+ 	if (unlikely(!desc->action || irqd_irq_disabled(&desc->irq_data))) {
+@@ -603,6 +625,20 @@ void handle_untracked_irq(struct irq_desc *desc)
+ }
+ EXPORT_SYMBOL_GPL(handle_untracked_irq);
+ 
++static inline void cond_eoi_irq(struct irq_desc *desc)
++{
++	struct irq_chip *chip = desc->irq_data.chip;
++
++	if (!(chip->flags & IRQCHIP_EOI_THREADED))
++		chip->irq_eoi(&desc->irq_data);
++}
++
++static inline void mask_cond_eoi_irq(struct irq_desc *desc)
++{
++	mask_irq(desc);
++	cond_eoi_irq(desc);
++}
++
+ /*
+  * Called unconditionally from handle_level_irq() and only for oneshot
+  * interrupts from handle_fasteoi_irq()
+@@ -633,10 +669,19 @@ static void cond_unmask_irq(struct irq_desc *desc)
+ void handle_level_irq(struct irq_desc *desc)
+ {
+ 	raw_spin_lock(&desc->lock);
+-	mask_ack_irq(desc);
+ 
+-	if (!irq_may_run(desc))
++	if (start_irq_flow()) {
++		mask_ack_irq(desc);
++
++		if (!irq_may_run(desc))
++			goto out_unlock;
++	}
++
++	if (on_pipeline_entry()) {
++		if (handle_oob_irq(desc))
++			goto out_unmask;
+ 		goto out_unlock;
++	}
+ 
+ 	desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
+ 
+@@ -651,7 +696,7 @@ void handle_level_irq(struct irq_desc *desc)
+ 
+ 	kstat_incr_irqs_this_cpu(desc);
+ 	handle_irq_event(desc);
+-
++out_unmask:
+ 	cond_unmask_irq(desc);
+ 
+ out_unlock:
+@@ -662,7 +707,10 @@ EXPORT_SYMBOL_GPL(handle_level_irq);
+ static void cond_unmask_eoi_irq(struct irq_desc *desc, struct irq_chip *chip)
+ {
+ 	if (!(desc->istate & IRQS_ONESHOT)) {
+-		chip->irq_eoi(&desc->irq_data);
++		if (!irqs_pipelined())
++			chip->irq_eoi(&desc->irq_data);
++		else if (!irqd_irq_disabled(&desc->irq_data))
++			unmask_irq(desc);
+ 		return;
+ 	}
+ 	/*
+@@ -673,9 +721,11 @@ static void cond_unmask_eoi_irq(struct irq_desc *desc, struct irq_chip *chip)
+ 	 */
+ 	if (!irqd_irq_disabled(&desc->irq_data) &&
+ 	    irqd_irq_masked(&desc->irq_data) && !desc->threads_oneshot) {
+-		chip->irq_eoi(&desc->irq_data);
++		if (!irqs_pipelined())
++			chip->irq_eoi(&desc->irq_data);
+ 		unmask_irq(desc);
+-	} else if (!(chip->flags & IRQCHIP_EOI_THREADED)) {
++	} else if (!irqs_pipelined() &&
++		   !(chip->flags & IRQCHIP_EOI_THREADED)) {
+ 		chip->irq_eoi(&desc->irq_data);
+ 	}
+ }
+@@ -695,9 +745,17 @@ void handle_fasteoi_irq(struct irq_desc *desc)
+ 
+ 	raw_spin_lock(&desc->lock);
+ 
+-	if (!irq_may_run(desc))
++	if (start_irq_flow() && !irq_may_run(desc))
+ 		goto out;
+ 
++	if (on_pipeline_entry()) {
++		if (handle_oob_irq(desc))
++			chip->irq_eoi(&desc->irq_data);
++		else
++			mask_cond_eoi_irq(desc);
++		goto out_unlock;
++	}
++
+ 	desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
+ 
+ 	/*
+@@ -711,13 +769,13 @@ void handle_fasteoi_irq(struct irq_desc *desc)
+ 	}
+ 
+ 	kstat_incr_irqs_this_cpu(desc);
+-	if (desc->istate & IRQS_ONESHOT)
++	if (!irqs_pipelined() && (desc->istate & IRQS_ONESHOT))
+ 		mask_irq(desc);
+ 
+ 	handle_irq_event(desc);
+ 
+ 	cond_unmask_eoi_irq(desc, chip);
+-
++out_unlock:
+ 	raw_spin_unlock(&desc->lock);
+ 	return;
+ out:
+@@ -777,30 +835,42 @@ EXPORT_SYMBOL_GPL(handle_fasteoi_nmi);
+  */
+ void handle_edge_irq(struct irq_desc *desc)
+ {
++	struct irq_chip *chip = irq_desc_get_chip(desc);
++
+ 	raw_spin_lock(&desc->lock);
+ 
+-	desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
++	if (start_irq_flow()) {
++		desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
+ 
+-	if (!irq_may_run(desc)) {
+-		desc->istate |= IRQS_PENDING;
+-		mask_ack_irq(desc);
+-		goto out_unlock;
++		if (!irq_may_run(desc)) {
++			desc->istate |= IRQS_PENDING;
++			mask_ack_irq(desc);
++			goto out_unlock;
++		}
++
++		/*
++		 * If its disabled or no action available then mask it
++		 * and get out of here.
++		 */
++		if (irqd_irq_disabled(&desc->irq_data) || !desc->action) {
++			desc->istate |= IRQS_PENDING;
++			mask_ack_irq(desc);
++			goto out_unlock;
++		}
+ 	}
+ 
+-	/*
+-	 * If its disabled or no action available then mask it and get
+-	 * out of here.
+-	 */
+-	if (irqd_irq_disabled(&desc->irq_data) || !desc->action) {
+-		desc->istate |= IRQS_PENDING;
+-		mask_ack_irq(desc);
++	if (on_pipeline_entry()) {
++		chip->irq_ack(&desc->irq_data);
++		desc->istate |= IRQS_EDGE;
++		handle_oob_irq(desc);
+ 		goto out_unlock;
+ 	}
+ 
+ 	kstat_incr_irqs_this_cpu(desc);
+ 
+ 	/* Start handling the irq */
+-	desc->irq_data.chip->irq_ack(&desc->irq_data);
++	if (!irqs_pipelined())
++		chip->irq_ack(&desc->irq_data);
+ 
+ 	do {
+ 		if (unlikely(!desc->action)) {
+@@ -825,6 +895,8 @@ void handle_edge_irq(struct irq_desc *desc)
+ 		 !irqd_irq_disabled(&desc->irq_data));
+ 
+ out_unlock:
++	if (on_pipeline_entry())
++		desc->istate &= ~IRQS_EDGE;
+ 	raw_spin_unlock(&desc->lock);
+ }
+ EXPORT_SYMBOL(handle_edge_irq);
+@@ -843,11 +915,20 @@ void handle_edge_eoi_irq(struct irq_desc *desc)
+ 
+ 	raw_spin_lock(&desc->lock);
+ 
+-	desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
++	if (start_irq_flow()) {
++		desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
+ 
+-	if (!irq_may_run(desc)) {
+-		desc->istate |= IRQS_PENDING;
+-		goto out_eoi;
++		if (!irq_may_run(desc)) {
++			desc->istate |= IRQS_PENDING;
++			goto out_eoi;
++		}
++	}
++
++	if (on_pipeline_entry()) {
++		desc->istate |= IRQS_EDGE;
++		if (handle_oob_irq(desc))
++			goto out_eoi;
++		goto out;
+ 	}
+ 
+ 	/*
+@@ -872,6 +953,9 @@ void handle_edge_eoi_irq(struct irq_desc *desc)
+ 
+ out_eoi:
+ 	chip->irq_eoi(&desc->irq_data);
++out:
++	if (on_pipeline_entry())
++		desc->istate &= ~IRQS_EDGE;
+ 	raw_spin_unlock(&desc->lock);
+ }
+ #endif
+@@ -885,6 +969,18 @@ void handle_edge_eoi_irq(struct irq_desc *desc)
+ void handle_percpu_irq(struct irq_desc *desc)
+ {
+ 	struct irq_chip *chip = irq_desc_get_chip(desc);
++	bool handled;
++
++	if (on_pipeline_entry()) {
++		if (chip->irq_ack)
++			chip->irq_ack(&desc->irq_data);
++		handled = handle_oob_irq(desc);
++		if (chip->irq_eoi)
++			chip->irq_eoi(&desc->irq_data);
++		if (!handled && chip->irq_mask)
++			chip->irq_mask(&desc->irq_data);
++		return;
++	}
+ 
+ 	/*
+ 	 * PER CPU interrupts are not serialized. Do not touch
+@@ -892,13 +988,17 @@ void handle_percpu_irq(struct irq_desc *desc)
+ 	 */
+ 	__kstat_incr_irqs_this_cpu(desc);
+ 
+-	if (chip->irq_ack)
+-		chip->irq_ack(&desc->irq_data);
+-
+-	handle_irq_event_percpu(desc);
+-
+-	if (chip->irq_eoi)
+-		chip->irq_eoi(&desc->irq_data);
++	if (irqs_pipelined()) {
++		handle_irq_event_percpu(desc);
++		if (chip->irq_unmask)
++			chip->irq_unmask(&desc->irq_data);
++	} else {
++		if (chip->irq_ack)
++			chip->irq_ack(&desc->irq_data);
++		handle_irq_event_percpu(desc);
++		if (chip->irq_eoi)
++			chip->irq_eoi(&desc->irq_data);
++	}
+ }
+ 
+ /**
+@@ -918,6 +1018,18 @@ void handle_percpu_devid_irq(struct irq_desc *desc)
+ 	struct irqaction *action = desc->action;
+ 	unsigned int irq = irq_desc_get_irq(desc);
+ 	irqreturn_t res;
++	bool handled;
++
++	if (on_pipeline_entry()) {
++		if (chip->irq_ack)
++			chip->irq_ack(&desc->irq_data);
++		handled = handle_oob_irq(desc);
++		if (chip->irq_eoi)
++			chip->irq_eoi(&desc->irq_data);
++		if (!handled && chip->irq_mask)
++			chip->irq_mask(&desc->irq_data);
++		return;
++	}
+ 
+ 	/*
+ 	 * PER CPU interrupts are not serialized. Do not touch
+@@ -925,7 +1037,7 @@ void handle_percpu_devid_irq(struct irq_desc *desc)
+ 	 */
+ 	__kstat_incr_irqs_this_cpu(desc);
+ 
+-	if (chip->irq_ack)
++	if (!irqs_pipelined() && chip->irq_ack)
+ 		chip->irq_ack(&desc->irq_data);
+ 
+ 	if (likely(action)) {
+@@ -943,8 +1055,11 @@ void handle_percpu_devid_irq(struct irq_desc *desc)
+ 			    enabled ? " and unmasked" : "", irq, cpu);
+ 	}
+ 
+-	if (chip->irq_eoi)
+-		chip->irq_eoi(&desc->irq_data);
++	if (irqs_pipelined()) {
++		if (chip->irq_unmask)
++			chip->irq_unmask(&desc->irq_data);
++	} else if (chip->irq_eoi)
++			chip->irq_eoi(&desc->irq_data);
+ }
+ 
+ /**
+@@ -964,11 +1079,22 @@ void handle_percpu_devid_fasteoi_ipi(struct irq_desc *desc)
+ 	unsigned int irq = irq_desc_get_irq(desc);
+ 	irqreturn_t res;
+ 
+-	__kstat_incr_irqs_this_cpu(desc);
+-
+ 	if (chip->irq_eoi)
+ 		chip->irq_eoi(&desc->irq_data);
+ 
++	if (on_pipeline_entry()) {
++		handle_oob_irq(desc);
++		return;
++	}
++
++	/* Trap spurious IPIs if pipelined. */
++	if (irqs_pipelined() && !action) {
++		print_irq_desc(irq, desc);
++		return;
++	}
++
++	__kstat_incr_irqs_this_cpu(desc);
++
+ 	trace_irq_handler_entry(irq, action);
+ 	res = action->handler(irq, raw_cpu_ptr(action->percpu_dev_id));
+ 	trace_irq_handler_exit(irq, action, res);
+@@ -1061,6 +1187,7 @@ __irq_do_set_handler(struct irq_desc *desc, irq_flow_handler_t handle,
+ 			desc->handle_irq = handle;
+ 		}
+ 
++		irq_settings_set_chained(desc);
+ 		irq_settings_set_noprobe(desc);
+ 		irq_settings_set_norequest(desc);
+ 		irq_settings_set_nothread(desc);
+@@ -1228,9 +1355,18 @@ void handle_fasteoi_ack_irq(struct irq_desc *desc)
+ 
+ 	raw_spin_lock(&desc->lock);
+ 
+-	if (!irq_may_run(desc))
++	if (start_irq_flow() && !irq_may_run(desc))
+ 		goto out;
+ 
++	if (on_pipeline_entry()) {
++		chip->irq_ack(&desc->irq_data);
++		if (handle_oob_irq(desc))
++			chip->irq_eoi(&desc->irq_data);
++		else
++			mask_cond_eoi_irq(desc);
++		goto out_unlock;
++	}
++
+ 	desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
+ 
+ 	/*
+@@ -1244,11 +1380,13 @@ void handle_fasteoi_ack_irq(struct irq_desc *desc)
+ 	}
+ 
+ 	kstat_incr_irqs_this_cpu(desc);
+-	if (desc->istate & IRQS_ONESHOT)
+-		mask_irq(desc);
++	if (!irqs_pipelined()) {
++		if (desc->istate & IRQS_ONESHOT)
++			mask_irq(desc);
+ 
+-	/* Start handling the irq */
+-	desc->irq_data.chip->irq_ack(&desc->irq_data);
++		/* Start handling the irq */
++		chip->irq_ack(&desc->irq_data);
++	}
+ 
+ 	handle_irq_event(desc);
+ 
+@@ -1259,6 +1397,7 @@ void handle_fasteoi_ack_irq(struct irq_desc *desc)
+ out:
+ 	if (!(chip->flags & IRQCHIP_EOI_IF_HANDLED))
+ 		chip->irq_eoi(&desc->irq_data);
++out_unlock:
+ 	raw_spin_unlock(&desc->lock);
+ }
+ EXPORT_SYMBOL_GPL(handle_fasteoi_ack_irq);
+@@ -1278,10 +1417,21 @@ void handle_fasteoi_mask_irq(struct irq_desc *desc)
+ 	struct irq_chip *chip = desc->irq_data.chip;
+ 
+ 	raw_spin_lock(&desc->lock);
+-	mask_ack_irq(desc);
+ 
+-	if (!irq_may_run(desc))
+-		goto out;
++	if (start_irq_flow()) {
++		mask_ack_irq(desc);
++
++		if (!irq_may_run(desc))
++			goto out;
++	}
++
++	if (on_pipeline_entry()) {
++		if (handle_oob_irq(desc))
++			chip->irq_eoi(&desc->irq_data);
++		else
++			cond_eoi_irq(desc);
++		goto out_unlock;
++	}
+ 
+ 	desc->istate &= ~(IRQS_REPLAY | IRQS_WAITING);
+ 
+@@ -1296,7 +1446,7 @@ void handle_fasteoi_mask_irq(struct irq_desc *desc)
+ 	}
+ 
+ 	kstat_incr_irqs_this_cpu(desc);
+-	if (desc->istate & IRQS_ONESHOT)
++	if (!irqs_pipelined() && (desc->istate & IRQS_ONESHOT))
+ 		mask_irq(desc);
+ 
+ 	handle_irq_event(desc);
+@@ -1308,6 +1458,7 @@ void handle_fasteoi_mask_irq(struct irq_desc *desc)
+ out:
+ 	if (!(chip->flags & IRQCHIP_EOI_IF_HANDLED))
+ 		chip->irq_eoi(&desc->irq_data);
++out_unlock:
+ 	raw_spin_unlock(&desc->lock);
+ }
+ EXPORT_SYMBOL_GPL(handle_fasteoi_mask_irq);
+diff --git a/kernel/irq/cpuhotplug.c b/kernel/irq/cpuhotplug.c
+index 02236b13b..dfd2cb3b6 100644
+--- a/kernel/irq/cpuhotplug.c
++++ b/kernel/irq/cpuhotplug.c
+@@ -156,6 +156,9 @@ void irq_migrate_all_off_this_cpu(void)
+ {
+ 	struct irq_desc *desc;
+ 	unsigned int irq;
++	unsigned long flags;
++
++	flags = hard_local_irq_save();
+ 
+ 	for_each_active_irq(irq) {
+ 		bool affinity_broken;
+@@ -170,6 +173,8 @@ void irq_migrate_all_off_this_cpu(void)
+ 					    irq, smp_processor_id());
+ 		}
+ 	}
++
++	hard_local_irq_restore(flags);
+ }
+ 
+ static bool hk_should_isolate(struct irq_data *data, unsigned int cpu)
+diff --git a/kernel/irq/debug.h b/kernel/irq/debug.h
+index 8ccb326d2..40f726845 100644
+--- a/kernel/irq/debug.h
++++ b/kernel/irq/debug.h
+@@ -33,6 +33,8 @@ static inline void print_irq_desc(unsigned int irq, struct irq_desc *desc)
+ 	___P(IRQ_NOREQUEST);
+ 	___P(IRQ_NOTHREAD);
+ 	___P(IRQ_NOAUTOEN);
++	___P(IRQ_OOB);
++	___P(IRQ_CHAINED);
+ 
+ 	___PS(IRQS_AUTODETECT);
+ 	___PS(IRQS_REPLAY);
+diff --git a/kernel/irq/dummychip.c b/kernel/irq/dummychip.c
+index 0b0cdf206..7bf8cbee1 100644
+--- a/kernel/irq/dummychip.c
++++ b/kernel/irq/dummychip.c
+@@ -43,7 +43,7 @@ struct irq_chip no_irq_chip = {
+ 	.irq_enable	= noop,
+ 	.irq_disable	= noop,
+ 	.irq_ack	= ack_bad,
+-	.flags		= IRQCHIP_SKIP_SET_WAKE,
++	.flags		= IRQCHIP_SKIP_SET_WAKE | IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ /*
+@@ -59,6 +59,6 @@ struct irq_chip dummy_irq_chip = {
+ 	.irq_ack	= noop,
+ 	.irq_mask	= noop,
+ 	.irq_unmask	= noop,
+-	.flags		= IRQCHIP_SKIP_SET_WAKE,
++	.flags		= IRQCHIP_SKIP_SET_WAKE | IRQCHIP_PIPELINE_SAFE,
+ };
+ EXPORT_SYMBOL_GPL(dummy_irq_chip);
+diff --git a/kernel/irq/handle.c b/kernel/irq/handle.c
+index 8806444a6..e4fe9c670 100644
+--- a/kernel/irq/handle.c
++++ b/kernel/irq/handle.c
+@@ -32,9 +32,16 @@ void handle_bad_irq(struct irq_desc *desc)
+ {
+ 	unsigned int irq = irq_desc_get_irq(desc);
+ 
++	/* Let the in-band stage report the issue. */
++	if (on_pipeline_entry()) {
++		ack_bad_irq(irq);
++		return;
++	}
++
+ 	print_irq_desc(irq, desc);
+ 	kstat_incr_irqs_this_cpu(desc);
+-	ack_bad_irq(irq);
++	if (!irqs_pipelined())
++		ack_bad_irq(irq);
+ }
+ EXPORT_SYMBOL_GPL(handle_bad_irq);
+ 
+diff --git a/kernel/irq/internals.h b/kernel/irq/internals.h
+index e58342ace..341c8f658 100644
+--- a/kernel/irq/internals.h
++++ b/kernel/irq/internals.h
+@@ -52,6 +52,7 @@ enum {
+  * IRQS_PENDING			- irq is pending and replayed later
+  * IRQS_SUSPENDED		- irq is suspended
+  * IRQS_NMI			- irq line is used to deliver NMIs
++ * IRQS_EDGE			- irq line received an edge event
+  */
+ enum {
+ 	IRQS_AUTODETECT		= 0x00000001,
+@@ -64,6 +65,7 @@ enum {
+ 	IRQS_SUSPENDED		= 0x00000800,
+ 	IRQS_TIMINGS		= 0x00001000,
+ 	IRQS_NMI		= 0x00002000,
++	IRQS_EDGE		= 0x00004000,
+ };
+ 
+ #include "debug.h"
+diff --git a/kernel/irq/irqdesc.c b/kernel/irq/irqdesc.c
+index ca36c6179..5c0cd9c20 100644
+--- a/kernel/irq/irqdesc.c
++++ b/kernel/irq/irqdesc.c
+@@ -16,6 +16,7 @@
+ #include <linux/bitmap.h>
+ #include <linux/irqdomain.h>
+ #include <linux/sysfs.h>
++#include <linux/irq_pipeline.h>
+ 
+ #include "internals.h"
+ 
+@@ -453,6 +454,7 @@ static void free_desc(unsigned int irq)
+ 	 * irq_sysfs_init() as well.
+ 	 */
+ 	irq_sysfs_del(desc);
++	uncache_irq_desc(irq);
+ 	delete_irq_desc(irq);
+ 
+ 	/*
+@@ -633,9 +635,12 @@ void irq_init_desc(unsigned int irq)
+ #endif /* !CONFIG_SPARSE_IRQ */
+ 
+ /**
+- * generic_handle_irq - Invoke the handler for a particular irq
++ * generic_handle_irq - Handle a particular irq
+  * @irq:	The irq number to handle
+  *
++ * The handler is invoked, unless we are entering the interrupt
++ * pipeline, in which case the incoming IRQ is only scheduled for
++ * deferred delivery.
+  */
+ int generic_handle_irq(unsigned int irq)
+ {
+@@ -646,7 +651,7 @@ int generic_handle_irq(unsigned int irq)
+ 		return -EINVAL;
+ 
+ 	data = irq_desc_get_irq_data(desc);
+-	if (WARN_ON_ONCE(!in_irq() && handle_enforce_irqctx(data)))
++	if (WARN_ON_ONCE(!in_hard_irq() && handle_enforce_irqctx(data)))
+ 		return -EPERM;
+ 
+ 	generic_handle_irq_desc(desc);
+diff --git a/kernel/irq/manage.c b/kernel/irq/manage.c
+index 92d94615c..fa184b7fc 100644
+--- a/kernel/irq/manage.c
++++ b/kernel/irq/manage.c
+@@ -10,6 +10,7 @@
+ 
+ #include <linux/irq.h>
+ #include <linux/kthread.h>
++#include <linux/kconfig.h>
+ #include <linux/module.h>
+ #include <linux/random.h>
+ #include <linux/interrupt.h>
+@@ -813,6 +814,50 @@ int irq_set_irq_wake(unsigned int irq, unsigned int on)
+ }
+ EXPORT_SYMBOL(irq_set_irq_wake);
+ 
++#ifdef CONFIG_IRQ_PIPELINE
++
++/**
++ *	irq_switch_oob - Control out-of-band setting for a registered IRQ descriptor
++ *	@irq:	interrupt to control
++ *	@on:	enable/disable pipelining
++ *
++ *	Enable/disable out-of-band handling for an IRQ. At least one
++ *	action must have been previously registered for such
++ *	interrupt.
++ *
++ *      The previously registered action(s) need(s) not bearing the
++ *      IRQF_OOB flag for the IRQ to be switched to out-of-band
++ *      handling. This call enables switching pre-installed IRQs from
++ *      in-band to out-of-band handling.
++ *
++ *      NOTE: This routine affects all action handlers sharing the
++ *      IRQ.
++ */
++int irq_switch_oob(unsigned int irq, bool on)
++{
++	struct irq_desc *desc;
++	unsigned long flags;
++	int ret = 0;
++
++	desc = irq_get_desc_lock(irq, &flags, 0);
++	if (!desc)
++		return -EINVAL;
++
++	if (!desc->action)
++		ret = -EINVAL;
++	else if (on)
++		irq_settings_set_oob(desc);
++	else
++		irq_settings_clr_oob(desc);
++
++	irq_put_desc_unlock(desc, flags);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(irq_switch_oob);
++
++#endif /* CONFIG_IRQ_PIPELINE */
++
+ /*
+  * Internal function that tells the architecture code whether a
+  * particular irq has been exclusively allocated or is available
+@@ -829,7 +874,8 @@ int can_request_irq(unsigned int irq, unsigned long irqflags)
+ 
+ 	if (irq_settings_can_request(desc)) {
+ 		if (!desc->action ||
+-		    irqflags & desc->action->flags & IRQF_SHARED)
++		    ((irqflags & desc->action->flags & IRQF_SHARED) &&
++		     !((irqflags ^ desc->action->flags) & IRQF_OOB)))
+ 			canrequest = 1;
+ 	}
+ 	irq_put_desc_unlock(desc, flags);
+@@ -1403,6 +1449,21 @@ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
+ 
+ 	new->irq = irq;
+ 
++	ret = -EINVAL;
++	/*
++	 *  Out-of-band interrupts can be shared but not threaded.  We
++	 *  silently ignore the OOB setting if interrupt pipelining is
++	 *  disabled.
++	 */
++	if (!irqs_pipelined())
++		new->flags &= ~IRQF_OOB;
++	else if (new->flags & IRQF_OOB) {
++		if (new->thread_fn)
++			goto out_mput;
++		new->flags |= IRQF_NO_THREAD;
++		new->flags &= ~IRQF_ONESHOT;
++	}
++
+ 	/*
+ 	 * If the trigger type is not specified by the caller,
+ 	 * then use the default for this interrupt.
+@@ -1416,10 +1477,8 @@ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
+ 	 */
+ 	nested = irq_settings_is_nested_thread(desc);
+ 	if (nested) {
+-		if (!new->thread_fn) {
+-			ret = -EINVAL;
++		if (!new->thread_fn)
+ 			goto out_mput;
+-		}
+ 		/*
+ 		 * Replace the primary handler which was provided from
+ 		 * the driver for non nested interrupt handling by the
+@@ -1503,7 +1562,7 @@ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
+ 		 * the same type (level, edge, polarity). So both flag
+ 		 * fields must have IRQF_SHARED set and the bits which
+ 		 * set the trigger type must match. Also all must
+-		 * agree on ONESHOT.
++		 * agree on ONESHOT and OOB.
+ 		 * Interrupt lines used for NMIs cannot be shared.
+ 		 */
+ 		unsigned int oldtype;
+@@ -1528,7 +1587,7 @@ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
+ 
+ 		if (!((old->flags & new->flags) & IRQF_SHARED) ||
+ 		    (oldtype != (new->flags & IRQF_TRIGGER_MASK)) ||
+-		    ((old->flags ^ new->flags) & IRQF_ONESHOT))
++		    ((old->flags ^ new->flags) & (IRQF_OOB|IRQF_ONESHOT)))
+ 			goto mismatch;
+ 
+ 		/* All handlers must agree on per-cpuness */
+@@ -1646,6 +1705,9 @@ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
+ 		if (new->flags & IRQF_ONESHOT)
+ 			desc->istate |= IRQS_ONESHOT;
+ 
++		if (new->flags & IRQF_OOB)
++			irq_settings_set_oob(desc);
++
+ 		/* Exclude IRQ from balancing if requested */
+ 		if (new->flags & IRQF_NOBALANCING) {
+ 			irq_settings_set_no_balancing(desc);
+@@ -1793,6 +1855,8 @@ static struct irqaction *__free_irq(struct irq_desc *desc, void *dev_id)
+ 		irq_settings_clr_disable_unlazy(desc);
+ 		/* Only shutdown. Deactivate after synchronize_hardirq() */
+ 		irq_shutdown(desc);
++		/* Turn off OOB handling (after shutdown). */
++		irq_settings_clr_oob(desc);
+ 	}
+ 
+ #ifdef CONFIG_SMP
+@@ -1829,14 +1893,15 @@ static struct irqaction *__free_irq(struct irq_desc *desc, void *dev_id)
+ 
+ #ifdef CONFIG_DEBUG_SHIRQ
+ 	/*
+-	 * It's a shared IRQ -- the driver ought to be prepared for an IRQ
+-	 * event to happen even now it's being freed, so let's make sure that
+-	 * is so by doing an extra call to the handler ....
++	 * It's a shared IRQ (with in-band handler) -- the driver
++	 * ought to be prepared for an IRQ event to happen even now
++	 * it's being freed, so let's make sure that is so by doing an
++	 * extra call to the handler ....
+ 	 *
+ 	 * ( We do this after actually deregistering it, to make sure that a
+ 	 *   'real' IRQ doesn't run in parallel with our fake. )
+ 	 */
+-	if (action->flags & IRQF_SHARED) {
++	if ((action->flags & (IRQF_SHARED|IRQF_OOB)) == IRQF_SHARED) {
+ 		local_irq_save(flags);
+ 		action->handler(irq, dev_id);
+ 		local_irq_restore(flags);
+@@ -2457,7 +2522,7 @@ int setup_percpu_irq(unsigned int irq, struct irqaction *act)
+  *	__request_percpu_irq - allocate a percpu interrupt line
+  *	@irq: Interrupt line to allocate
+  *	@handler: Function to be called when the IRQ occurs.
+- *	@flags: Interrupt type flags (IRQF_TIMER only)
++ *	@flags: Interrupt type flags (IRQF_TIMER and/or IRQF_OOB only)
+  *	@devname: An ascii name for the claiming device
+  *	@dev_id: A percpu cookie passed back to the handler function
+  *
+@@ -2486,7 +2551,7 @@ int __request_percpu_irq(unsigned int irq, irq_handler_t handler,
+ 	    !irq_settings_is_per_cpu_devid(desc))
+ 		return -EINVAL;
+ 
+-	if (flags && flags != IRQF_TIMER)
++	if (flags & ~(IRQF_TIMER|IRQF_OOB))
+ 		return -EINVAL;
+ 
+ 	action = kzalloc(sizeof(struct irqaction), GFP_KERNEL);
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index d217acc9f..2c25bafe5 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -272,6 +272,9 @@ static void msi_domain_update_chip_ops(struct msi_domain_info *info)
+ 	struct irq_chip *chip = info->chip;
+ 
+ 	BUG_ON(!chip || !chip->irq_mask || !chip->irq_unmask);
++	WARN_ONCE(IS_ENABLED(CONFIG_IRQ_PIPELINE) &&
++		  (chip->flags & IRQCHIP_PIPELINE_SAFE) == 0,
++		  "MSI domain irqchip %s is not pipeline-safe!", chip->name);
+ 	if (!chip->irq_set_affinity)
+ 		chip->irq_set_affinity = msi_domain_set_affinity;
+ }
+diff --git a/kernel/irq/pipeline.c b/kernel/irq/pipeline.c
+new file mode 100644
+index 000000000..b123af89b
+--- /dev/null
++++ b/kernel/irq/pipeline.c
+@@ -0,0 +1,1662 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright (C) 2016 Philippe Gerum  <rpm@xenomai.org>.
++ */
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/irqdomain.h>
++#include <linux/irq_pipeline.h>
++#include <linux/irq_work.h>
++#include <linux/jhash.h>
++#include <linux/debug_locks.h>
++#include <dovetail/irq.h>
++#include <trace/events/irq.h>
++#include "internals.h"
++
++#ifdef CONFIG_DEBUG_IRQ_PIPELINE
++#define trace_on_debug
++#else
++#define trace_on_debug  notrace
++#endif
++
++struct irq_stage inband_stage = {
++	.name = "Linux",
++};
++EXPORT_SYMBOL_GPL(inband_stage);
++
++struct irq_stage oob_stage;
++EXPORT_SYMBOL_GPL(oob_stage);
++
++struct irq_domain *synthetic_irq_domain;
++EXPORT_SYMBOL_GPL(synthetic_irq_domain);
++
++bool irq_pipeline_oopsing;
++EXPORT_SYMBOL_GPL(irq_pipeline_oopsing);
++
++bool irq_pipeline_active;
++EXPORT_SYMBOL_GPL(irq_pipeline_active);
++
++#define IRQ_L1_MAPSZ	BITS_PER_LONG
++#define IRQ_L2_MAPSZ	(BITS_PER_LONG * BITS_PER_LONG)
++#define IRQ_FLAT_MAPSZ	DIV_ROUND_UP(IRQ_BITMAP_BITS, BITS_PER_LONG)
++
++#if IRQ_FLAT_MAPSZ > IRQ_L2_MAPSZ
++#define __IRQ_STAGE_MAP_LEVELS	4	/* up to 4/16M vectors */
++#elif IRQ_FLAT_MAPSZ > IRQ_L1_MAPSZ
++#define __IRQ_STAGE_MAP_LEVELS	3	/* up to 64/256M vectors */
++#else
++#define __IRQ_STAGE_MAP_LEVELS	2	/* up to 1024/4096 vectors */
++#endif
++
++struct irq_event_map {
++#if __IRQ_STAGE_MAP_LEVELS >= 3
++	unsigned long index_1[IRQ_L1_MAPSZ];
++#if __IRQ_STAGE_MAP_LEVELS >= 4
++	unsigned long index_2[IRQ_L2_MAPSZ];
++#endif
++#endif
++	unsigned long flat[IRQ_FLAT_MAPSZ];
++};
++
++#ifdef CONFIG_SMP
++
++static struct irq_event_map bootup_irq_map __initdata;
++
++static DEFINE_PER_CPU(struct irq_event_map, irq_map_array[2]);
++
++DEFINE_PER_CPU(struct irq_pipeline_data, irq_pipeline) = {
++	.stages = {
++		[0] = {
++			.log = {
++				.map = &bootup_irq_map,
++			},
++			.stage = &inband_stage,
++		},
++	},
++};
++
++#else /* !CONFIG_SMP */
++
++static struct irq_event_map inband_irq_map;
++
++static struct irq_event_map oob_irq_map;
++
++DEFINE_PER_CPU(struct irq_pipeline_data, irq_pipeline) = {
++	.stages = {
++		[0] = {
++			.log = {
++				.map = &inband_irq_map,
++			},
++			.stage = &inband_stage,
++		},
++		[1] = {
++			.log = {
++				.map = &oob_irq_map,
++			},
++		},
++	},
++};
++
++#endif /* !CONFIG_SMP */
++
++EXPORT_PER_CPU_SYMBOL(irq_pipeline);
++
++static void sirq_noop(struct irq_data *data) { }
++
++/* Virtual interrupt controller for synthetic IRQs. */
++static struct irq_chip sirq_chip = {
++	.name		= "SIRQC",
++	.irq_enable	= sirq_noop,
++	.irq_disable	= sirq_noop,
++	.flags		= IRQCHIP_PIPELINE_SAFE | IRQCHIP_SKIP_SET_WAKE,
++};
++
++static int sirq_map(struct irq_domain *d, unsigned int irq,
++		    irq_hw_number_t hwirq)
++{
++	irq_set_percpu_devid(irq);
++	irq_set_chip_and_handler(irq, &sirq_chip, handle_synthetic_irq);
++
++	return 0;
++}
++
++static struct irq_domain_ops sirq_domain_ops = {
++	.map	= sirq_map,
++};
++
++#ifdef CONFIG_SPARSE_IRQ
++/*
++ * The performances of the radix tree in sparse mode are really ugly
++ * under mm stress on some hw, use a local descriptor cache to ease
++ * the pain.
++ */
++#define DESC_CACHE_SZ  128
++
++static struct irq_desc *desc_cache[DESC_CACHE_SZ] __cacheline_aligned;
++
++static inline u32 hash_irq(unsigned int irq)
++{
++	return jhash(&irq, sizeof(irq), irq) % DESC_CACHE_SZ;
++}
++
++static __always_inline
++struct irq_desc *cached_irq_to_desc(unsigned int irq)
++{
++	int hval = hash_irq(irq);
++	struct irq_desc *desc = desc_cache[hval];
++
++	if (unlikely(desc == NULL || irq_desc_get_irq(desc) != irq)) {
++		desc = irq_to_desc(irq);
++		desc_cache[hval] = desc;
++	}
++
++	return desc;
++}
++
++void uncache_irq_desc(unsigned int irq)
++{
++	int hval = hash_irq(irq);
++
++	desc_cache[hval] = NULL;
++}
++
++#else
++
++static struct irq_desc *cached_irq_to_desc(unsigned int irq)
++{
++	return irq_to_desc(irq);
++}
++
++#endif
++
++/**
++ *	handle_synthetic_irq -  synthetic irq handler
++ *	@desc:	the interrupt description structure for this irq
++ *
++ *	Handles synthetic interrupts flowing down the IRQ pipeline
++ *	with per-CPU semantics.
++ *
++ *      CAUTION: synthetic IRQs may be used to map hardware-generated
++ *      events (e.g. IPIs or traps), we must start handling them as
++ *      common interrupts.
++ */
++void handle_synthetic_irq(struct irq_desc *desc)
++{
++	unsigned int irq = irq_desc_get_irq(desc);
++	struct irqaction *action;
++	irqreturn_t ret;
++	void *dev_id;
++
++	if (on_pipeline_entry()) {
++		handle_oob_irq(desc);
++		return;
++	}
++
++	action = desc->action;
++	if (action == NULL) {
++		if (printk_ratelimit())
++			printk(KERN_WARNING
++			       "CPU%d: WARNING: synthetic IRQ%d has no action.\n",
++			       smp_processor_id(), irq);
++		return;
++	}
++
++	__kstat_incr_irqs_this_cpu(desc);
++	trace_irq_handler_entry(irq, action);
++	dev_id = raw_cpu_ptr(action->percpu_dev_id);
++	ret = action->handler(irq, dev_id);
++	trace_irq_handler_exit(irq, action, ret);
++}
++
++void sync_irq_stage(struct irq_stage *top)
++{
++	struct irq_stage_data *p;
++	struct irq_stage *stage;
++
++	/* We must enter over the inband stage with hardirqs off. */
++	if (irq_pipeline_debug()) {
++		WARN_ON_ONCE(!hard_irqs_disabled());
++		WARN_ON_ONCE(current_irq_stage != &inband_stage);
++	}
++
++	stage = top;
++
++	for (;;) {
++		if (stage == &inband_stage) {
++			if (test_inband_stall())
++				break;
++		} else {
++			if (test_oob_stall())
++				break;
++		}
++
++		p = this_staged(stage);
++		if (stage_irqs_pending(p)) {
++			if (stage == &inband_stage)
++				sync_current_irq_stage();
++			else {
++				/* Switch to oob before synchronizing. */
++				switch_oob(p);
++				sync_current_irq_stage();
++				/* Then back to the inband stage. */
++				switch_inband(this_inband_staged());
++			}
++		}
++
++		if (stage == &inband_stage)
++			break;
++
++		stage = &inband_stage;
++	}
++}
++
++void synchronize_pipeline(void) /* hardirqs off */
++{
++	struct irq_stage *top = &oob_stage;
++	int stalled = test_oob_stall();
++
++	if (unlikely(!oob_stage_present())) {
++		top = &inband_stage;
++		stalled = test_inband_stall();
++	}
++
++	if (current_irq_stage != top)
++		sync_irq_stage(top);
++	else if (!stalled)
++		sync_current_irq_stage();
++}
++
++static void __inband_irq_enable(void)
++{
++	struct irq_stage_data *p;
++	unsigned long flags;
++
++	check_inband_stage();
++
++	flags = hard_local_irq_save();
++
++	unstall_inband_nocheck();
++	trace_hardirqs_on();
++
++	p = this_inband_staged();
++	if (unlikely(stage_irqs_pending(p) && !in_pipeline())) {
++		sync_current_irq_stage();
++		hard_local_irq_restore(flags);
++		preempt_check_resched();
++	} else {
++		hard_local_irq_restore(flags);
++	}
++}
++
++/**
++ *	inband_irq_enable - enable interrupts for the inband stage
++ *
++ *	Enable interrupts for the inband stage, allowing interrupts to
++ *	preempt the in-band code. If in-band IRQs are pending for the
++ *	inband stage in the per-CPU log at the time of this call, they
++ *	are played back.
++ *
++ *      The caller is expected to tell the tracer about the change, by
++ *      calling trace_hardirqs_on().
++ */
++notrace void inband_irq_enable(void)
++{
++	/*
++	 * We are NOT supposed to enter this code with hard IRQs off.
++	 * If we do, then the caller might be wrongly assuming that
++	 * invoking local_irq_enable() implies enabling hard
++	 * interrupts like the legacy I-pipe did, which is not the
++	 * case anymore. Relax this requirement when oopsing, since
++	 * the kernel may be in a weird state.
++	 */
++	WARN_ON_ONCE(irq_pipeline_debug() && hard_irqs_disabled());
++	__inband_irq_enable();
++}
++EXPORT_SYMBOL(inband_irq_enable);
++
++/**
++ *	inband_irq_disable - disable interrupts for the inband stage
++ *
++ *	Disable interrupts for the inband stage, disabling in-band
++ *	interrupts. Out-of-band interrupts can still be taken and
++ *	delivered to their respective handlers though.
++ */
++notrace void inband_irq_disable(void)
++{
++	check_inband_stage();
++	stall_inband_nocheck();
++	trace_hardirqs_off();
++}
++EXPORT_SYMBOL(inband_irq_disable);
++
++/**
++ *	inband_irqs_disabled - test the virtual interrupt state
++ *
++ *	Returns non-zero if interrupts are currently disabled for the
++ *	inband stage, zero otherwise.
++ *
++ *	May be used from the oob stage too (e.g. for tracing
++ *	purpose).
++ */
++noinstr int inband_irqs_disabled(void)
++{
++	return test_inband_stall();
++}
++EXPORT_SYMBOL(inband_irqs_disabled);
++
++/**
++ *	inband_irq_save - test and disable (virtual) interrupts
++ *
++ *	Save the virtual interrupt state then disables interrupts for
++ *	the inband stage.
++ *
++ *      Returns the original interrupt state.
++ */
++trace_on_debug unsigned long inband_irq_save(void)
++{
++	unsigned long flags;
++
++	check_inband_stage();
++	flags = test_and_stall_inband_nocheck();
++	trace_hardirqs_off();
++
++	return flags;
++}
++EXPORT_SYMBOL(inband_irq_save);
++
++/**
++ *	inband_irq_restore - restore the (virtual) interrupt state
++ *      @x:	Interrupt state to restore
++ *
++ *	Restore the virtual interrupt state from x. If the inband
++ *	stage is unstalled as a consequence of this operation, any
++ *	interrupt pending for the inband stage in the per-CPU log is
++ *	played back.
++ */
++trace_on_debug void inband_irq_restore(unsigned long flags)
++{
++	if (flags)
++		inband_irq_disable();
++	else
++		__inband_irq_enable();
++}
++EXPORT_SYMBOL(inband_irq_restore);
++
++/**
++ *	oob_irq_enable - enable interrupts in the CPU
++ *
++ *	Enable interrupts in the CPU, allowing out-of-band interrupts
++ *	to preempt any code. If out-of-band IRQs are pending in the
++ *	per-CPU log for the oob stage at the time of this call, they
++ *	are played back.
++ */
++trace_on_debug void oob_irq_enable(void)
++{
++	struct irq_stage_data *p;
++
++	hard_local_irq_disable();
++
++	unstall_oob();
++
++	p = this_oob_staged();
++	if (unlikely(stage_irqs_pending(p)))
++		synchronize_pipeline();
++
++	hard_local_irq_enable();
++}
++EXPORT_SYMBOL(oob_irq_enable);
++
++/**
++ *	oob_irq_restore - restore the hardware interrupt state
++ *      @x:	Interrupt state to restore
++ *
++ *	Restore the harware interrupt state from x. If the oob stage
++ *	is unstalled as a consequence of this operation, any interrupt
++ *	pending for the oob stage in the per-CPU log is played back
++ *	prior to turning IRQs on.
++ *
++ *      NOTE: Stalling the oob stage must always be paired with
++ *      disabling hard irqs and conversely when calling
++ *      oob_irq_restore(), otherwise the latter would badly misbehave
++ *      in unbalanced conditions.
++ */
++trace_on_debug void __oob_irq_restore(unsigned long flags) /* hw interrupt off */
++{
++	struct irq_stage_data *p = this_oob_staged();
++
++	check_hard_irqs_disabled();
++
++	if (!flags) {
++		unstall_oob();
++		if (unlikely(stage_irqs_pending(p)))
++			synchronize_pipeline();
++		hard_local_irq_enable();
++	}
++}
++EXPORT_SYMBOL(__oob_irq_restore);
++
++/**
++ *	stage_disabled - test the interrupt state of the current stage
++ *
++ *	Returns non-zero if interrupts are currently disabled for the
++ *	current interrupt stage, zero otherwise.
++ *      In other words, returns non-zero either if:
++ *      - interrupts are disabled for the OOB context (i.e. hard disabled),
++ *      - the inband stage is current and inband interrupts are disabled.
++ */
++noinstr bool stage_disabled(void)
++{
++	bool ret = true;
++
++	if (!hard_irqs_disabled()) {
++		ret = false;
++		if (running_inband())
++			ret = test_inband_stall();
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(stage_disabled);
++
++/**
++ *	test_and_lock_stage - test and disable interrupts for the current stage
++ *	@irqsoff:	Pointer to boolean denoting stage_disabled()
++ *                      on entry
++ *
++ *	Fully disables interrupts for the current stage. When the
++ *	inband stage is current, the stall bit is raised and hardware
++ *	IRQs are masked as well. Only the latter operation is
++ *	performed when the oob stage is current.
++ *
++ *      Returns the combined interrupt state on entry including the
++ *      real/hardware (in CPU) and virtual (inband stage) states. For
++ *      this reason, [test_and_]lock_stage() must be paired with
++ *      unlock_stage() exclusively. The combined irq state returned by
++ *      the former may NOT be passed to hard_local_irq_restore().
++ *
++ *      The interrupt state of the current stage in the return value
++ *      (i.e. stall bit for the inband stage, hardware interrupt bit
++ *      for the oob stage) must be testable using
++ *      arch_irqs_disabled_flags().
++ *
++ *	Notice that test_and_lock_stage(), unlock_stage() are raw
++ *	level ops, which substitute to raw_local_irq_save(),
++ *	raw_local_irq_restore() in lockdep code. Therefore, changes to
++ *	the in-band stall bit must not be propagated to the tracing
++ *	core (i.e. no trace_hardirqs_*() annotations).
++ */
++noinstr unsigned long test_and_lock_stage(int *irqsoff)
++{
++	unsigned long flags;
++	int stalled, dummy;
++
++	if (irqsoff == NULL)
++		irqsoff = &dummy;
++
++	/*
++	 * Combine the hard irq flag and the stall bit into a single
++	 * state word. We need to fill in the stall bit only if the
++	 * inband stage is current, otherwise it is not relevant.
++	 */
++	flags = hard_local_irq_save();
++	*irqsoff = hard_irqs_disabled_flags(flags);
++	if (running_inband()) {
++		stalled = test_and_stall_inband_nocheck();
++		flags = irqs_merge_flags(flags, stalled);
++		if (stalled)
++			*irqsoff = 1;
++	}
++
++	/*
++	 * CAUTION: don't ever pass this verbatim to
++	 * hard_local_irq_restore(). Only unlock_stage() knows how to
++	 * decode and use a combined state word.
++	 */
++	return flags;
++}
++EXPORT_SYMBOL_GPL(test_and_lock_stage);
++
++/**
++ *	unlock_stage - restore interrupts for the current stage
++ *	@flags: 	Combined interrupt state to restore as received from
++ *              	test_and_lock_stage()
++ *
++ *	Restore the virtual interrupt state if the inband stage is
++ *      current, and the hardware interrupt state unconditionally.
++ *      The per-CPU log is not played for any stage.
++ */
++noinstr void unlock_stage(unsigned long irqstate)
++{
++	unsigned long flags = irqstate;
++	int stalled;
++
++	WARN_ON_ONCE(irq_pipeline_debug_locking() && !hard_irqs_disabled());
++
++	if (running_inband()) {
++		flags = irqs_split_flags(irqstate, &stalled);
++		if (!stalled)
++			unstall_inband_nocheck();
++	}
++
++	/*
++	 * The hardware interrupt bit is the only flag which may be
++	 * present in the combined state at this point, all other
++	 * status bits have been cleared by irqs_merge_flags(), so
++	 * don't ever try to reload the hardware status register with
++	 * such value directly!
++	 */
++	if (!hard_irqs_disabled_flags(flags))
++		hard_local_irq_enable();
++}
++EXPORT_SYMBOL_GPL(unlock_stage);
++
++/**
++ * sync_inband_irqs	- Synchronize the inband log
++ *
++ * Play any deferred interrupt which might have been logged for the
++ * in-band stage while running with hard irqs on but stalled.
++ *
++ * Called from the unstalled in-band stage. Returns with hard irqs off.
++ */
++void sync_inband_irqs(void)
++{
++	struct irq_stage_data *p;
++
++	check_inband_stage();
++	WARN_ON_ONCE(irq_pipeline_debug() && irqs_disabled());
++
++	if (!hard_irqs_disabled())
++		hard_local_irq_disable();
++
++	p = this_inband_staged();
++	if (unlikely(stage_irqs_pending(p))) {
++		/* Do not pile up preemption frames. */
++		preempt_disable_notrace();
++		sync_current_irq_stage();
++		preempt_enable_no_resched_notrace();
++	}
++}
++
++static inline bool irq_post_check(struct irq_stage *stage, unsigned int irq)
++{
++	if (irq_pipeline_debug()) {
++		if (WARN_ONCE(!hard_irqs_disabled(),
++				"hard irqs on posting IRQ%u to %s\n",
++				irq, stage->name))
++			return true;
++		if (WARN_ONCE(irq >= IRQ_BITMAP_BITS,
++				"cannot post invalid IRQ%u to %s\n",
++				irq, stage->name))
++			return true;
++	}
++
++	return false;
++}
++
++#if __IRQ_STAGE_MAP_LEVELS == 4
++
++/* Must be called hard irqs off. */
++void irq_post_stage(struct irq_stage *stage, unsigned int irq)
++{
++	struct irq_stage_data *p = this_staged(stage);
++	int l0b, l1b, l2b;
++
++	if (irq_post_check(stage, irq))
++		return;
++
++	l0b = irq / (BITS_PER_LONG * BITS_PER_LONG * BITS_PER_LONG);
++	l1b = irq / (BITS_PER_LONG * BITS_PER_LONG);
++	l2b = irq / BITS_PER_LONG;
++
++	__set_bit(irq, p->log.map->flat);
++	__set_bit(l2b, p->log.map->index_2);
++	__set_bit(l1b, p->log.map->index_1);
++	__set_bit(l0b, &p->log.index_0);
++}
++EXPORT_SYMBOL_GPL(irq_post_stage);
++
++#define ltob_1(__n)  ((__n) * BITS_PER_LONG)
++#define ltob_2(__n)  (ltob_1(__n) * BITS_PER_LONG)
++#define ltob_3(__n)  (ltob_2(__n) * BITS_PER_LONG)
++
++static inline int pull_next_irq(struct irq_stage_data *p)
++{
++	unsigned long l0m, l1m, l2m, l3m;
++	int l0b, l1b, l2b, l3b;
++	unsigned int irq;
++
++	l0m = p->log.index_0;
++	if (l0m == 0)
++		return -1;
++	l0b = __ffs(l0m);
++	irq = ltob_3(l0b);
++
++	l1m = p->log.map->index_1[l0b];
++	if (unlikely(l1m == 0)) {
++		WARN_ON_ONCE(1);
++		return -1;
++	}
++	l1b = __ffs(l1m);
++	irq += ltob_2(l1b);
++
++	l2m = p->log.map->index_2[ltob_1(l0b) + l1b];
++	if (unlikely(l2m == 0)) {
++		WARN_ON_ONCE(1);
++		return -1;
++	}
++	l2b = __ffs(l2m);
++	irq += ltob_1(l2b);
++
++	l3m = p->log.map->flat[ltob_2(l0b) + ltob_1(l1b) + l2b];
++	if (unlikely(l3m == 0))
++		return -1;
++	l3b = __ffs(l3m);
++	irq += l3b;
++
++	__clear_bit(irq, p->log.map->flat);
++	if (p->log.map->flat[irq / BITS_PER_LONG] == 0) {
++		__clear_bit(l2b, &p->log.map->index_2[ltob_1(l0b) + l1b]);
++		if (p->log.map->index_2[ltob_1(l0b) + l1b] == 0) {
++			__clear_bit(l1b, &p->log.map->index_1[l0b]);
++			if (p->log.map->index_1[l0b] == 0)
++				__clear_bit(l0b, &p->log.index_0);
++		}
++	}
++
++	return irq;
++}
++
++#elif __IRQ_STAGE_MAP_LEVELS == 3
++
++/* Must be called hard irqs off. */
++void irq_post_stage(struct irq_stage *stage, unsigned int irq)
++{
++	struct irq_stage_data *p = this_staged(stage);
++	int l0b, l1b;
++
++	if (irq_post_check(stage, irq))
++		return;
++
++	l0b = irq / (BITS_PER_LONG * BITS_PER_LONG);
++	l1b = irq / BITS_PER_LONG;
++
++	__set_bit(irq, p->log.map->flat);
++	__set_bit(l1b, p->log.map->index_1);
++	__set_bit(l0b, &p->log.index_0);
++}
++EXPORT_SYMBOL_GPL(irq_post_stage);
++
++static inline int pull_next_irq(struct irq_stage_data *p)
++{
++	unsigned long l0m, l1m, l2m;
++	int l0b, l1b, l2b, irq;
++
++	l0m = p->log.index_0;
++	if (unlikely(l0m == 0))
++		return -1;
++
++	l0b = __ffs(l0m);
++	l1m = p->log.map->index_1[l0b];
++	if (l1m == 0)
++		return -1;
++
++	l1b = __ffs(l1m) + l0b * BITS_PER_LONG;
++	l2m = p->log.map->flat[l1b];
++	if (unlikely(l2m == 0)) {
++		WARN_ON_ONCE(1);
++		return -1;
++	}
++
++	l2b = __ffs(l2m);
++	irq = l1b * BITS_PER_LONG + l2b;
++
++	__clear_bit(irq, p->log.map->flat);
++	if (p->log.map->flat[l1b] == 0) {
++		__clear_bit(l1b, p->log.map->index_1);
++		if (p->log.map->index_1[l0b] == 0)
++			__clear_bit(l0b, &p->log.index_0);
++	}
++
++	return irq;
++}
++
++#else /* __IRQ_STAGE_MAP_LEVELS == 2 */
++
++/* Must be called hard irqs off. */
++void irq_post_stage(struct irq_stage *stage, unsigned int irq)
++{
++	struct irq_stage_data *p = this_staged(stage);
++	int l0b = irq / BITS_PER_LONG;
++
++	if (irq_post_check(stage, irq))
++		return;
++
++	__set_bit(irq, p->log.map->flat);
++	__set_bit(l0b, &p->log.index_0);
++}
++EXPORT_SYMBOL_GPL(irq_post_stage);
++
++static inline int pull_next_irq(struct irq_stage_data *p)
++{
++	unsigned long l0m, l1m;
++	int l0b, l1b;
++
++	l0m = p->log.index_0;
++	if (l0m == 0)
++		return -1;
++
++	l0b = __ffs(l0m);
++	l1m = p->log.map->flat[l0b];
++	if (unlikely(l1m == 0)) {
++		WARN_ON_ONCE(1);
++		return -1;
++	}
++
++	l1b = __ffs(l1m);
++	__clear_bit(l1b, &p->log.map->flat[l0b]);
++	if (p->log.map->flat[l0b] == 0)
++		__clear_bit(l0b, &p->log.index_0);
++
++	return l0b * BITS_PER_LONG + l1b;
++}
++
++#endif  /* __IRQ_STAGE_MAP_LEVELS == 2 */
++
++/**
++ *	hard_preempt_disable - Disable preemption the hard way
++ *
++ *      Disable hardware interrupts in the CPU, and disable preemption
++ *      if currently running in-band code on the inband stage.
++ *
++ *      Return the hardware interrupt state.
++ */
++unsigned long hard_preempt_disable(void)
++{
++	unsigned long flags = hard_local_irq_save();
++
++	if (running_inband())
++		preempt_disable();
++
++	return flags;
++}
++EXPORT_SYMBOL_GPL(hard_preempt_disable);
++
++/**
++ *	hard_preempt_enable - Enable preemption the hard way
++ *
++ *      Enable preemption if currently running in-band code on the
++ *      inband stage, restoring the hardware interrupt state in the CPU.
++ *      The per-CPU log is not played for the oob stage.
++ */
++void hard_preempt_enable(unsigned long flags)
++{
++	if (running_inband()) {
++		preempt_enable_no_resched();
++		hard_local_irq_restore(flags);
++		if (!hard_irqs_disabled_flags(flags))
++			preempt_check_resched();
++	} else
++		hard_local_irq_restore(flags);
++}
++EXPORT_SYMBOL_GPL(hard_preempt_enable);
++
++static void handle_unexpected_irq(struct irq_desc *desc, irqreturn_t ret)
++{
++	unsigned int irq = irq_desc_get_irq(desc);
++	struct irqaction *action;
++
++	/*
++	 * Since IRQ_HANDLED was not received from any handler, we may
++	 * have a problem dealing with an OOB interrupt. The error
++	 * detection logic is as follows:
++	 *
++	 * - check and complain about any bogus return value from a
++	 * out-of-band IRQ handler: we only allow IRQ_HANDLED and
++	 * IRQ_NONE from those routines.
++	 *
++	 * - filter out spurious IRQs which may have been due to bus
++	 * asynchronicity, those tend to happen infrequently and
++	 * should not cause us to pull the break (see
++	 * note_interrupt()).
++	 *
++	 * - otherwise, stop pipelining the IRQ line after a thousand
++	 * consecutive unhandled events.
++	 *
++	 * NOTE: we should already be holding desc->lock for non
++	 * per-cpu IRQs, since we should only get there from the
++	 * pipeline entry context.
++	 */
++
++	WARN_ON_ONCE(irq_pipeline_debug() &&
++		     !irq_settings_is_per_cpu(desc) &&
++		     !raw_spin_is_locked(&desc->lock));
++
++	if (ret != IRQ_NONE) {
++		printk(KERN_ERR "out-of-band irq event %d: bogus return value %x\n",
++		       irq, ret);
++		for_each_action_of_desc(desc, action)
++			printk(KERN_ERR "[<%p>] %pf",
++			       action->handler, action->handler);
++		printk(KERN_CONT "\n");
++		return;
++	}
++
++	if (time_after(jiffies, desc->last_unhandled + HZ/10))
++		desc->irqs_unhandled = 0;
++	else
++		desc->irqs_unhandled++;
++
++	desc->last_unhandled = jiffies;
++
++	if (unlikely(desc->irqs_unhandled > 1000)) {
++		printk(KERN_ERR "out-of-band irq %d: stuck or unexpected\n", irq);
++		irq_settings_clr_oob(desc);
++		desc->istate |= IRQS_SPURIOUS_DISABLED;
++		irq_disable(desc);
++	}
++}
++
++static inline void incr_irq_kstat(struct irq_desc *desc)
++{
++	if (irq_settings_is_per_cpu_devid(desc))
++		__kstat_incr_irqs_this_cpu(desc);
++	else
++		kstat_incr_irqs_this_cpu(desc);
++}
++
++/*
++ * do_oob_irq() - Handles interrupts over the oob stage. Hard irqs
++ * off.
++ */
++static void do_oob_irq(struct irq_desc *desc)
++{
++	bool percpu_devid = irq_settings_is_per_cpu_devid(desc);
++	unsigned int irq = irq_desc_get_irq(desc);
++	irqreturn_t ret = IRQ_NONE, res;
++	struct irqaction *action;
++	void *dev_id;
++
++	action = desc->action;
++	if (unlikely(action == NULL))
++		goto done;
++
++	if (percpu_devid) {
++		trace_irq_handler_entry(irq, action);
++		dev_id = raw_cpu_ptr(action->percpu_dev_id);
++		ret = action->handler(irq, dev_id);
++		trace_irq_handler_exit(irq, action, ret);
++	} else {
++		desc->istate &= ~IRQS_PENDING;
++		if (unlikely(irqd_irq_disabled(&desc->irq_data)))
++			return;
++		irqd_set(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++		raw_spin_unlock(&desc->lock);
++		for_each_action_of_desc(desc, action) {
++			trace_irq_handler_entry(irq, action);
++			dev_id = action->dev_id;
++			res = action->handler(irq, dev_id);
++			trace_irq_handler_exit(irq, action, res);
++			ret |= res;
++		}
++		raw_spin_lock(&desc->lock);
++		irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
++	}
++done:
++	incr_irq_kstat(desc);
++
++	if (likely(ret & IRQ_HANDLED)) {
++		desc->irqs_unhandled = 0;
++		return;
++	}
++
++	handle_unexpected_irq(desc, ret);
++}
++
++/*
++ * Over the inband stage, IRQs must be dispatched by the arch-specific
++ * arch_do_IRQ_pipelined() routine.
++ *
++ * Entered with hardirqs on, inband stalled.
++ */
++static inline
++void do_inband_irq(struct irq_desc *desc)
++{
++	arch_do_IRQ_pipelined(desc);
++	WARN_ON_ONCE(irq_pipeline_debug() && !irqs_disabled());
++}
++
++static inline bool is_active_edge_event(struct irq_desc *desc)
++{
++	return (desc->istate & IRQS_PENDING) &&
++		!irqd_irq_disabled(&desc->irq_data);
++}
++
++bool handle_oob_irq(struct irq_desc *desc) /* hardirqs off */
++{
++	struct irq_stage_data *oobd = this_oob_staged();
++	unsigned int irq = irq_desc_get_irq(desc);
++
++	/*
++	 * Flow handlers of chained interrupts have no business
++	 * running here: they should decode the event, invoking
++	 * generic_handle_irq() for each cascaded IRQ.
++	 */
++	if (WARN_ON_ONCE(irq_pipeline_debug() &&
++			 irq_settings_is_chained(desc)))
++		return false;
++
++	/*
++	 * If no oob stage is present, all interrupts must go to the
++	 * inband stage through the interrupt log. Otherwise,
++	 * out-of-band IRQs are immediately delivered to the oob
++	 * stage, while in-band IRQs still go through the inband stage
++	 * log.
++	 *
++	 * This routine returns a boolean status telling the caller
++	 * whether an out-of-band interrupt was delivered.
++	 */
++	if (!oob_stage_present() || !irq_settings_is_oob(desc)) {
++		irq_post_stage(&inband_stage, irq);
++		return false;
++	}
++
++	if (WARN_ON_ONCE(irq_pipeline_debug() && running_inband()))
++		return false;
++	/*
++	 * Running with the oob stage stalled implies hardirqs off, so
++	 * if the oob stage is stalled on pipeline entry, something is
++	 * badly broken in our interrupt state. Pretend the event has
++	 * been handled, which may end up with the device hammering us
++	 * with more interrupts, but there is no safe option at this
++	 * point.
++	 */
++	if (WARN_ON_ONCE(irq_pipeline_debug() &&
++			on_pipeline_entry() && test_oob_stall()))
++		return true;
++
++	stall_oob();
++
++	if (unlikely(desc->istate & IRQS_EDGE)) {
++		do {
++			if (is_active_edge_event(desc))  {
++				if (irqd_irq_masked(&desc->irq_data))
++					unmask_irq(desc);
++			}
++			do_oob_irq(desc);
++		} while (is_active_edge_event(desc));
++	} else {
++		do_oob_irq(desc);
++	}
++
++	unstall_oob();
++
++	/*
++	 * CPU migration and/or stage switching over the handler are
++	 * NOT allowed. These should take place over
++	 * irq_exit_pipeline().
++	 */
++	if (irq_pipeline_debug()) {
++		/* No CPU migration allowed. */
++		WARN_ON_ONCE(this_oob_staged() != oobd);
++		/* No stage migration allowed. */
++		WARN_ON_ONCE(current_irq_staged != oobd);
++	}
++
++	return true;
++}
++
++static inline
++void copy_timer_regs(struct irq_desc *desc, struct pt_regs *regs)
++{
++	struct irq_pipeline_data *p;
++
++	if (desc->action == NULL || !(desc->action->flags & __IRQF_TIMER))
++		return;
++	/*
++	 * Given our deferred dispatching model for regular IRQs, we
++	 * record the preempted context registers only for the latest
++	 * timer interrupt, so that the regular tick handler charges
++	 * CPU times properly. It is assumed that no other interrupt
++	 * handler cares for such information.
++	 */
++	p = raw_cpu_ptr(&irq_pipeline);
++	arch_save_timer_regs(&p->tick_regs, regs);
++}
++
++static __always_inline
++struct irq_stage_data *switch_stage_on_irq(void)
++{
++	struct irq_stage_data *prevd = current_irq_staged, *nextd;
++
++	if (oob_stage_present()) {
++		nextd = this_oob_staged();
++		if (prevd != nextd)
++			switch_oob(nextd);
++	}
++
++	return prevd;
++}
++
++static __always_inline
++void restore_stage_on_irq(struct irq_stage_data *prevd)
++{
++	/*
++	 * CPU migration and/or stage switching over
++	 * irq_exit_pipeline() are allowed.  Our exit logic is as
++	 * follows:
++	 *
++	 *    ENTRY      EXIT      EPILOGUE
++	 *
++	 *    oob        oob       nop
++	 *    inband     oob       switch inband
++	 *    oob        inband    nop
++	 *    inband     inband    nop
++	 */
++	if (prevd->stage == &inband_stage &&
++		current_irq_staged == this_oob_staged())
++		switch_inband(this_inband_staged());
++}
++
++/**
++ *	generic_pipeline_irq - Pass an IRQ to the pipeline
++ *	@irq:	IRQ to pass
++ *	@regs:	Register file coming from the low-level handling code
++ *
++ *	Inject an IRQ into the pipeline from a CPU interrupt or trap
++ *	context.  A flow handler runs for this IRQ.
++ *
++ *      Hard irqs must be off on entry.
++ */
++int generic_pipeline_irq(unsigned int irq, struct pt_regs *regs)
++{
++	struct pt_regs *old_regs;
++	struct irq_desc *desc;
++	int ret = 0;
++
++	trace_irq_pipeline_entry(irq);
++
++	old_regs = set_irq_regs(regs);
++	desc = cached_irq_to_desc(irq);
++
++	if (irq_pipeline_debug()) {
++		if (!hard_irqs_disabled()) {
++			hard_local_irq_disable();
++			pr_err("IRQ pipeline: interrupts enabled on entry (IRQ%u)\n",
++			       irq);
++		}
++		if (unlikely(desc == NULL)) {
++			pr_err("IRQ pipeline: received unhandled IRQ%u\n",
++			       irq);
++			ret = -EINVAL;
++			goto out;
++		}
++	}
++
++	/*
++	 * We may re-enter this routine either legitimately due to
++	 * stacked IRQ domains, or because some chained IRQ handler is
++	 * abusing the API, and should have called
++	 * generic_handle_irq() instead of us. In any case, deal with
++	 * re-entry gracefully.
++	 */
++	if (unlikely(on_pipeline_entry())) {
++		if (WARN_ON_ONCE(irq_pipeline_debug() &&
++				 irq_settings_is_chained(desc)))
++			generic_handle_irq_desc(desc);
++		goto out;
++	}
++
++	/*
++	 * We switch eagerly to the oob stage if present, so that a
++	 * companion kernel readily runs on the right stage when we
++	 * call its out-of-band IRQ handler from handle_oob_irq(),
++	 * then irq_exit_pipeline() to unwind the interrupt context.
++	 */
++	copy_timer_regs(desc, regs);
++	preempt_count_add(PIPELINE_OFFSET);
++	generic_handle_irq_desc(desc);
++	preempt_count_sub(PIPELINE_OFFSET);
++out:
++	set_irq_regs(old_regs);
++	trace_irq_pipeline_exit(irq);
++
++	return ret;
++}
++
++struct irq_stage_data *handle_irq_pipelined_prepare(struct pt_regs *regs)
++{
++	struct irq_stage_data *prevd;
++
++	prevd = switch_stage_on_irq();
++	irq_enter_pipeline();
++
++	return prevd;
++}
++
++int handle_irq_pipelined_finish(struct irq_stage_data *prevd,
++				struct pt_regs *regs)
++{
++	irq_exit_pipeline();
++	restore_stage_on_irq(prevd);
++
++	/*
++	 * We have to synchronize the logs because interrupts might
++	 * have been logged while we were busy handling an OOB event
++	 * coming from the hardware:
++	 *
++	 * - as a result of calling an OOB handler which in turn
++	 * posted them.
++	 *
++	 * - because we posted them directly for scheduling the
++	 * interrupt to happen from the inband stage.
++	 */
++	synchronize_pipeline_on_irq();
++
++	return running_inband() && !irqs_disabled();
++}
++
++int handle_irq_pipelined(struct pt_regs *regs)
++{
++	struct irq_stage_data *prevd;
++
++	prevd = handle_irq_pipelined_prepare(regs);
++	handle_arch_irq(regs);
++	return handle_irq_pipelined_finish(prevd, regs);
++}
++
++/**
++ *	irq_inject_pipeline - Inject a software-generated IRQ into the
++ *	pipeline @irq: IRQ to inject
++ *
++ *	Inject an IRQ into the pipeline by software as if such
++ *	hardware event had happened on the current CPU.
++ */
++int irq_inject_pipeline(unsigned int irq)
++{
++	struct irq_stage_data *oobd, *prevd;
++	struct irq_desc *desc;
++	unsigned long flags;
++
++	desc = cached_irq_to_desc(irq);
++	if (desc == NULL)
++		return -EINVAL;
++
++	flags = hard_local_irq_save();
++
++	/*
++	 * Handle the case of an IRQ sent to a stalled oob stage here,
++	 * which allows to trap the same condition in handle_oob_irq()
++	 * in a debug check (see comment there).
++	 */
++	oobd = this_oob_staged();
++	if (oob_stage_present() &&
++		irq_settings_is_oob(desc) &&
++		test_oob_stall()) {
++		irq_post_stage(&oob_stage, irq);
++	} else {
++		prevd = switch_stage_on_irq();
++		irq_enter_pipeline();
++		handle_oob_irq(desc);
++		irq_exit_pipeline();
++		restore_stage_on_irq(prevd);
++		synchronize_pipeline_on_irq();
++	}
++
++	hard_local_irq_restore(flags);
++
++	return 0;
++
++}
++EXPORT_SYMBOL_GPL(irq_inject_pipeline);
++
++/*
++ * sync_current_irq_stage() -- Flush the pending IRQs for the current
++ * stage (and processor). This routine flushes the interrupt log (see
++ * "Optimistic interrupt protection" from D. Stodolsky et al. for more
++ * on the deferred interrupt scheme). Every interrupt which has
++ * occurred while the pipeline was stalled gets played.
++ *
++ * CAUTION: CPU migration may occur over this routine if running over
++ * the inband stage.
++ */
++void sync_current_irq_stage(void) /* hard irqs off */
++{
++	struct irq_stage_data *p;
++	struct irq_stage *stage;
++	struct irq_desc *desc;
++	int irq;
++
++	WARN_ON_ONCE(irq_pipeline_debug() && on_pipeline_entry());
++	check_hard_irqs_disabled();
++
++	p = current_irq_staged;
++respin:
++	stage = p->stage;
++	if (stage == &inband_stage) {
++		/*
++		 * Since we manipulate the stall bit directly, we have
++		 * to open code the IRQ state tracing.
++		 */
++		stall_inband_nocheck();
++		trace_hardirqs_off();
++	} else {
++		stall_oob();
++	}
++
++	for (;;) {
++		irq = pull_next_irq(p);
++		if (irq < 0)
++			break;
++		/*
++		 * Make sure the compiler does not reorder wrongly, so
++		 * that all updates to maps are done before the
++		 * handler gets called.
++		 */
++		barrier();
++
++		desc = cached_irq_to_desc(irq);
++
++		if (stage == &inband_stage) {
++			hard_local_irq_enable();
++			do_inband_irq(desc);
++			hard_local_irq_disable();
++		} else {
++			do_oob_irq(desc);
++		}
++
++		/*
++		 * We might have switched from the oob stage to the
++		 * in-band one on return from the handler, in which
++		 * case we might also have migrated to a different CPU
++		 * (the converse in-band -> oob switch is NOT allowed
++		 * though). Reload the current per-cpu context
++		 * pointer, so that we further pull pending interrupts
++		 * from the proper in-band log.
++		 */
++		p = current_irq_staged;
++		if (p->stage != stage) {
++			if (WARN_ON_ONCE(irq_pipeline_debug() &&
++					stage == &inband_stage))
++				break;
++			goto respin;
++		}
++	}
++
++	if (stage == &inband_stage) {
++		trace_hardirqs_on();
++		unstall_inband_nocheck();
++	} else {
++		unstall_oob();
++	}
++}
++
++/**
++ *      run_oob_call - escalate function call to the oob stage
++ *      @fn:    address of routine
++ *      @arg:   routine argument
++ *
++ *      Make the specified function run on the oob stage, switching
++ *      the current stage accordingly if needed. The escalated call is
++ *      allowed to perform a stage migration in the process.
++ */
++int notrace run_oob_call(int (*fn)(void *arg), void *arg)
++{
++	struct irq_stage_data *p, *old;
++	struct irq_stage *oob;
++	unsigned long flags;
++	int ret, s;
++
++	flags = hard_local_irq_save();
++
++	/* Switch to the oob stage if not current. */
++	p = this_oob_staged();
++	oob = p->stage;
++	old = current_irq_staged;
++	if (old != p)
++		switch_oob(p);
++
++	s = test_and_stall_oob();
++	barrier();
++	ret = fn(arg);
++	hard_local_irq_disable();
++	if (!s)
++		unstall_oob();
++
++	/*
++	 * The exit logic is as follows:
++	 *
++	 *    ON-ENTRY  AFTER-CALL  EPILOGUE
++	 *
++	 *    oob       oob         sync current stage if !stalled
++	 *    inband    oob         switch to inband + sync all stages
++	 *    oob       inband      sync all stages
++	 *    inband    inband      sync all stages
++	 *
++	 * Each path which has stalled the oob stage while running on
++	 * the inband stage at some point during the escalation
++	 * process must synchronize all stages of the pipeline on
++	 * exit. Otherwise, we may restrict the synchronization scope
++	 * to the current stage when the whole sequence ran on the oob
++	 * stage.
++	 */
++	p = this_oob_staged();
++	if (likely(current_irq_staged == p)) {
++		if (old->stage == oob) {
++			if (!s && stage_irqs_pending(p))
++				sync_current_irq_stage();
++			goto out;
++		}
++		switch_inband(this_inband_staged());
++	}
++
++	sync_irq_stage(oob);
++out:
++	hard_local_irq_restore(flags);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(run_oob_call);
++
++int enable_oob_stage(const char *name)
++{
++	struct irq_event_map *map;
++	struct irq_stage_data *p;
++	int cpu, ret;
++
++	if (oob_stage_present())
++		return -EBUSY;
++
++	/* Set up the out-of-band interrupt stage on all CPUs. */
++
++	for_each_possible_cpu(cpu) {
++		p = &per_cpu(irq_pipeline.stages, cpu)[1];
++		map = p->log.map; /* save/restore after memset(). */
++		memset(p, 0, sizeof(*p));
++		p->stage = &oob_stage;
++		memset(map, 0, sizeof(struct irq_event_map));
++		p->log.map = map;
++#ifdef CONFIG_DEBUG_IRQ_PIPELINE
++		p->cpu = cpu;
++#endif
++	}
++
++	ret = arch_enable_oob_stage();
++	if (ret)
++		return ret;
++
++	oob_stage.name = name;
++	smp_wmb();
++	oob_stage.index = 1;
++
++	pr_info("IRQ pipeline: high-priority %s stage added.\n", name);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(enable_oob_stage);
++
++void disable_oob_stage(void)
++{
++	const char *name = oob_stage.name;
++
++	WARN_ON(!running_inband() || !oob_stage_present());
++
++	oob_stage.index = 0;
++	smp_wmb();
++
++	pr_info("IRQ pipeline: %s stage removed.\n", name);
++}
++EXPORT_SYMBOL_GPL(disable_oob_stage);
++
++void irq_pipeline_oops(void)
++{
++	irq_pipeline_oopsing = true;
++	local_irq_disable_full();
++}
++
++/*
++ * Used to save/restore the status bits of the inband stage across runs
++ * of NMI-triggered code, so that we can restore the original pipeline
++ * state before leaving NMI context.
++ */
++static DEFINE_PER_CPU(unsigned long, nmi_saved_stall_bits);
++
++noinstr void irq_pipeline_nmi_enter(void)
++{
++	raw_cpu_write(nmi_saved_stall_bits, current->stall_bits);
++
++}
++EXPORT_SYMBOL(irq_pipeline_nmi_enter);
++
++noinstr void irq_pipeline_nmi_exit(void)
++{
++	current->stall_bits = raw_cpu_read(nmi_saved_stall_bits);
++}
++EXPORT_SYMBOL(irq_pipeline_nmi_exit);
++
++bool __weak irq_cpuidle_control(struct cpuidle_device *dev,
++				struct cpuidle_state *state)
++{
++	/*
++	 * Allow entering the idle state by default, matching the
++	 * original behavior when CPU_IDLE is turned
++	 * on. irq_cpuidle_control() may be overriden by an
++	 * out-of-band code for determining whether the CPU may
++	 * actually enter the idle state.
++	 */
++	return true;
++}
++
++/**
++ *	irq_cpuidle_enter - Prepare for entering the next idle state
++ *	@dev: CPUIDLE device
++ *	@state: CPUIDLE state to be entered
++ *
++ *	Flush the in-band interrupt log before the caller idles, so
++ *	that no event lingers before we actually wait for the next
++ *	IRQ, in which case we ask the caller to abort the idling
++ *	process altogether. The companion core is also given the
++ *	opportunity to block the idling process by having
++ *	irq_cpuidle_control() return @false.
++ *
++ *	Returns @true if caller may proceed with idling, @false
++ *	otherwise. The in-band log is guaranteed empty on return, hard
++ *	irqs left off so that no event might sneak in until the caller
++ *	actually idles.
++ */
++bool irq_cpuidle_enter(struct cpuidle_device *dev,
++		       struct cpuidle_state *state)
++{
++	WARN_ON_ONCE(irq_pipeline_debug() && !irqs_disabled());
++
++	hard_local_irq_disable();
++
++	if (stage_irqs_pending(this_inband_staged())) {
++		unstall_inband_nocheck();
++		synchronize_pipeline();
++		stall_inband_nocheck();
++		return false;
++	}
++
++	return irq_cpuidle_control(dev, state);
++}
++
++static unsigned int inband_work_sirq;
++
++static irqreturn_t inband_work_interrupt(int sirq, void *dev_id)
++{
++	irq_work_run();
++
++	return IRQ_HANDLED;
++}
++
++static struct irqaction inband_work = {
++	.handler = inband_work_interrupt,
++	.name = "in-band work",
++	.flags = IRQF_NO_THREAD,
++};
++
++void irq_local_work_raise(void)
++{
++	unsigned long flags;
++
++	/*
++	 * irq_work_queue() may be called from the in-band stage too
++	 * in case we want to delay a work until the hard irqs are on
++	 * again, so we may only sync the in-band log when unstalled,
++	 * with hard irqs on.
++	 */
++	flags = hard_local_irq_save();
++	irq_post_inband(inband_work_sirq);
++	if (running_inband() &&
++	    !hard_irqs_disabled_flags(flags) && !irqs_disabled())
++		sync_current_irq_stage();
++	hard_local_irq_restore(flags);
++}
++
++#ifdef CONFIG_DEBUG_IRQ_PIPELINE
++
++#ifdef CONFIG_LOCKDEP
++static inline bool lockdep_on_error(void)
++{
++	return !debug_locks;
++}
++#else
++static inline bool lockdep_on_error(void)
++{
++	return false;
++}
++#endif
++
++notrace void check_inband_stage(void)
++{
++	struct irq_stage *this_stage;
++	unsigned long flags;
++
++	flags = hard_local_irq_save();
++
++	this_stage = current_irq_stage;
++	if (likely(this_stage == &inband_stage && !test_oob_stall())) {
++		hard_local_irq_restore(flags);
++		return;
++	}
++
++	if (in_nmi() || irq_pipeline_oopsing || lockdep_on_error()) {
++		hard_local_irq_restore(flags);
++		return;
++	}
++
++	/*
++	 * This will disable all further pipeline debug checks, since
++	 * a wrecked interrupt state is likely to trigger many of
++	 * them, ending up in a terrible mess. IOW, the current
++	 * situation must be fixed prior to investigating any
++	 * subsequent issue that might still exist.
++	 */
++	irq_pipeline_oopsing = true;
++
++	hard_local_irq_restore(flags);
++
++	if (this_stage != &inband_stage)
++		pr_err("IRQ pipeline: some code running in oob context '%s'\n"
++		       "              called an in-band only routine\n",
++		       this_stage->name);
++	else
++		pr_err("IRQ pipeline: oob stage found stalled while modifying in-band\n"
++		       "              interrupt state and/or running sleeping code\n");
++
++	dump_stack();
++}
++EXPORT_SYMBOL(check_inband_stage);
++
++void check_spinlock_context(void)
++{
++	WARN_ON_ONCE(in_pipeline() || running_oob());
++
++}
++EXPORT_SYMBOL(check_spinlock_context);
++
++#endif /* CONFIG_DEBUG_IRQ_PIPELINE */
++
++static inline void fixup_percpu_data(void)
++{
++#ifdef CONFIG_SMP
++	struct irq_pipeline_data *p;
++	int cpu;
++
++	/*
++	 * A temporary event log is used by the inband stage during the
++	 * early boot up (bootup_irq_map), until the per-cpu areas
++	 * have been set up.
++	 *
++	 * Obviously, this code must run over the boot CPU, before SMP
++	 * operations start, with hard IRQs off so that nothing can
++	 * change under our feet.
++	 */
++	WARN_ON(!hard_irqs_disabled());
++
++	memcpy(&per_cpu(irq_map_array, 0)[0], &bootup_irq_map,
++	       sizeof(struct irq_event_map));
++
++	for_each_possible_cpu(cpu) {
++		p = &per_cpu(irq_pipeline, cpu);
++		p->stages[0].stage = &inband_stage;
++		p->stages[0].log.map = &per_cpu(irq_map_array, cpu)[0];
++		p->stages[1].log.map = &per_cpu(irq_map_array, cpu)[1];
++#ifdef CONFIG_DEBUG_IRQ_PIPELINE
++		p->stages[0].cpu = cpu;
++		p->stages[1].cpu = cpu;
++#endif
++	}
++#endif
++}
++
++void __init irq_pipeline_init_early(void)
++{
++	/*
++	 * This is called early from start_kernel(), even before the
++	 * actual number of IRQs is known. We are running on the boot
++	 * CPU, hw interrupts are off, and secondary CPUs are still
++	 * lost in space. Careful.
++	 */
++	fixup_percpu_data();
++}
++
++/**
++ *	irq_pipeline_init - Main pipeline core inits
++ *
++ *	This is step #2 of the 3-step pipeline initialization, which
++ *	should happen right after init_IRQ() has run. The internal
++ *	service interrupts are created along with the synthetic IRQ
++ *	domain, and the arch-specific init chores are performed too.
++ *
++ *	Interrupt pipelining should be fully functional when this
++ *	routine returns.
++ */
++void __init irq_pipeline_init(void)
++{
++	WARN_ON(!hard_irqs_disabled());
++
++	synthetic_irq_domain = irq_domain_add_nomap(NULL, ~0,
++						    &sirq_domain_ops,
++						    NULL);
++	inband_work_sirq = irq_create_direct_mapping(synthetic_irq_domain);
++	setup_percpu_irq(inband_work_sirq, &inband_work);
++
++	/*
++	 * We are running on the boot CPU, hw interrupts are off, and
++	 * secondary CPUs are still lost in space. Now we may run
++	 * arch-specific code for enabling the pipeline.
++	 */
++	arch_irq_pipeline_init();
++
++	irq_pipeline_active = true;
++
++	pr_info("IRQ pipeline enabled\n");
++}
++
++#ifndef CONFIG_SPARSE_IRQ
++EXPORT_SYMBOL_GPL(irq_desc);
++#endif
+diff --git a/kernel/irq/resend.c b/kernel/irq/resend.c
+index 8ccd32a0c..01b9f2383 100644
+--- a/kernel/irq/resend.c
++++ b/kernel/irq/resend.c
+@@ -16,10 +16,11 @@
+ #include <linux/module.h>
+ #include <linux/random.h>
+ #include <linux/interrupt.h>
++#include <linux/irq_pipeline.h>
+ 
+ #include "internals.h"
+ 
+-#ifdef CONFIG_HARDIRQS_SW_RESEND
++#if defined(CONFIG_HARDIRQS_SW_RESEND) && !defined(CONFIG_IRQ_PIPELINE)
+ 
+ /* Bitmap to handle software resend of interrupts: */
+ static DECLARE_BITMAP(irqs_resend, IRQ_BITMAP_BITS);
+@@ -82,7 +83,12 @@ static int irq_sw_resend(struct irq_desc *desc)
+ #else
+ static int irq_sw_resend(struct irq_desc *desc)
+ {
++#if defined(CONFIG_HARDIRQS_SW_RESEND) && defined(CONFIG_IRQ_PIPELINE)
++	irq_inject_pipeline(irq_desc_get_irq(desc));
++	return 0;
++#else
+ 	return -EINVAL;
++#endif
+ }
+ #endif
+ 
+diff --git a/kernel/irq/settings.h b/kernel/irq/settings.h
+index 403378b99..da2331c7c 100644
+--- a/kernel/irq/settings.h
++++ b/kernel/irq/settings.h
+@@ -18,6 +18,8 @@ enum {
+ 	_IRQ_IS_POLLED		= IRQ_IS_POLLED,
+ 	_IRQ_DISABLE_UNLAZY	= IRQ_DISABLE_UNLAZY,
+ 	_IRQ_HIDDEN		= IRQ_HIDDEN,
++	_IRQ_OOB		= IRQ_OOB,
++	_IRQ_CHAINED		= IRQ_CHAINED,
+ 	_IRQF_MODIFY_MASK	= IRQF_MODIFY_MASK,
+ };
+ 
+@@ -33,6 +35,8 @@ enum {
+ #define IRQ_IS_POLLED		GOT_YOU_MORON
+ #define IRQ_DISABLE_UNLAZY	GOT_YOU_MORON
+ #define IRQ_HIDDEN		GOT_YOU_MORON
++#define IRQ_OOB			GOT_YOU_MORON
++#define IRQ_CHAINED		GOT_YOU_MORON
+ #undef IRQF_MODIFY_MASK
+ #define IRQF_MODIFY_MASK	GOT_YOU_MORON
+ 
+@@ -174,3 +178,33 @@ static inline bool irq_settings_is_hidden(struct irq_desc *desc)
+ {
+ 	return desc->status_use_accessors & _IRQ_HIDDEN;
+ }
++
++static inline bool irq_settings_is_oob(struct irq_desc *desc)
++{
++	return desc->status_use_accessors & _IRQ_OOB;
++}
++
++static inline void irq_settings_clr_oob(struct irq_desc *desc)
++{
++	desc->status_use_accessors &= ~_IRQ_OOB;
++}
++
++static inline void irq_settings_set_oob(struct irq_desc *desc)
++{
++	desc->status_use_accessors |= _IRQ_OOB;
++}
++
++static inline bool irq_settings_is_chained(struct irq_desc *desc)
++{
++	return desc->status_use_accessors & _IRQ_CHAINED;
++}
++
++static inline void irq_settings_set_chained(struct irq_desc *desc)
++{
++	desc->status_use_accessors |= _IRQ_CHAINED;
++}
++
++static inline void irq_settings_clr_chained(struct irq_desc *desc)
++{
++	desc->status_use_accessors &= ~_IRQ_CHAINED;
++}
+diff --git a/kernel/irq_work.c b/kernel/irq_work.c
+index eca83965b..54d36f1ec 100644
+--- a/kernel/irq_work.c
++++ b/kernel/irq_work.c
+@@ -49,6 +49,11 @@ void __weak arch_irq_work_raise(void)
+ 	 */
+ }
+ 
++void __weak irq_local_work_raise(void)
++{
++	arch_irq_work_raise();
++}
++
+ /* Enqueue on current CPU, work must already be claimed and preempt disabled */
+ static void __irq_work_queue_local(struct irq_work *work)
+ {
+@@ -56,10 +61,10 @@ static void __irq_work_queue_local(struct irq_work *work)
+ 	if (atomic_read(&work->flags) & IRQ_WORK_LAZY) {
+ 		if (llist_add(&work->llnode, this_cpu_ptr(&lazy_list)) &&
+ 		    tick_nohz_tick_stopped())
+-			arch_irq_work_raise();
++			irq_local_work_raise();
+ 	} else {
+ 		if (llist_add(&work->llnode, this_cpu_ptr(&raised_list)))
+-			arch_irq_work_raise();
++			irq_local_work_raise();
+ 	}
+ }
+ 
+diff --git a/kernel/kthread.c b/kernel/kthread.c
+index 508fe5278..dcc78665d 100644
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@ -14,6 +14,7 @@
+ #include <linux/sched/mm.h>
+ #include <linux/sched/task.h>
+ #include <linux/kthread.h>
++#include <linux/irq_pipeline.h>
+ #include <linux/completion.h>
+ #include <linux/err.h>
+ #include <linux/cgroup.h>
+diff --git a/kernel/locking/Makefile b/kernel/locking/Makefile
+index 6d11cfb9b..c491040bd 100644
+--- a/kernel/locking/Makefile
++++ b/kernel/locking/Makefile
+@@ -28,6 +28,7 @@ obj-$(CONFIG_RT_MUTEXES) += rtmutex.o
+ obj-$(CONFIG_DEBUG_RT_MUTEXES) += rtmutex-debug.o
+ obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock.o
+ obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock_debug.o
++obj-$(CONFIG_IRQ_PIPELINE) += pipeline.o
+ obj-$(CONFIG_QUEUED_RWLOCKS) += qrwlock.o
+ obj-$(CONFIG_LOCK_TORTURE_TEST) += locktorture.o
+ obj-$(CONFIG_WW_MUTEX_SELFTEST) += test-ww_mutex.o
+diff --git a/kernel/locking/lockdep.c b/kernel/locking/lockdep.c
+index 6cbd2b444..669135812 100644
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@ -42,6 +42,7 @@
+ #include <linux/stacktrace.h>
+ #include <linux/debug_locks.h>
+ #include <linux/irqflags.h>
++#include <linux/irqstage.h>
+ #include <linux/utsname.h>
+ #include <linux/hash.h>
+ #include <linux/ftrace.h>
+@@ -104,9 +105,56 @@ static __always_inline bool lockdep_enabled(void)
+ static arch_spinlock_t __lock = (arch_spinlock_t)__ARCH_SPIN_LOCK_UNLOCKED;
+ static struct task_struct *__owner;
+ 
++static __always_inline bool lockdep_stage_disabled(void)
++{
++	return stage_disabled();
++}
++
++#ifdef CONFIG_IRQ_PIPELINE
++/*
++ * If LOCKDEP is enabled, we want irqs to be disabled for both stages
++ * when traversing the lockdep code for hard and mutable locks (at the
++ * expense of massive latency overhead though).
++ */
++static __always_inline unsigned long lockdep_stage_test_and_disable(int *irqsoff)
++{
++	return test_and_lock_stage(irqsoff);
++}
++
++static __always_inline unsigned long lockdep_stage_disable(void)
++{
++	return lockdep_stage_test_and_disable(NULL);
++}
++
++static __always_inline void lockdep_stage_restore(unsigned long flags)
++{
++	unlock_stage(flags);
++}
++
++#else
++
++#define lockdep_stage_test_and_disable(__irqsoff)		\
++	({							\
++		unsigned long __flags;				\
++		raw_local_irq_save(__flags);			\
++		*(__irqsoff) = irqs_disabled_flags(__flags);	\
++		__flags;					\
++	})
++
++#define lockdep_stage_disable()					\
++	({							\
++		unsigned long __flags;				\
++		raw_local_irq_save(__flags);			\
++		__flags;					\
++	})
++
++#define lockdep_stage_restore(__flags)		raw_local_irq_restore(__flags)
++
++#endif /* !CONFIG_IRQ_PIPELINE */
++
+ static inline void lockdep_lock(void)
+ {
+-	DEBUG_LOCKS_WARN_ON(!irqs_disabled());
++	DEBUG_LOCKS_WARN_ON(!lockdep_stage_disabled());
+ 
+ 	__this_cpu_inc(lockdep_recursion);
+ 	arch_spin_lock(&__lock);
+@@ -882,7 +930,7 @@ look_up_lock_class(const struct lockdep_map *lock, unsigned int subclass)
+ 	/*
+ 	 * We do an RCU walk of the hash, see lockdep_free_key_range().
+ 	 */
+-	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++	if (DEBUG_LOCKS_WARN_ON(!lockdep_stage_disabled()))
+ 		return NULL;
+ 
+ 	hlist_for_each_entry_rcu_notrace(class, hash_head, hash_entry) {
+@@ -1239,7 +1287,7 @@ register_lock_class(struct lockdep_map *lock, unsigned int subclass, int force)
+ 	struct lock_class *class;
+ 	int idx;
+ 
+-	DEBUG_LOCKS_WARN_ON(!irqs_disabled());
++	DEBUG_LOCKS_WARN_ON(!lockdep_stage_disabled());
+ 
+ 	class = look_up_lock_class(lock, subclass);
+ 	if (likely(class))
+@@ -4197,7 +4245,7 @@ void lockdep_hardirqs_on_prepare(unsigned long ip)
+ 	 * already enabled, yet we find the hardware thinks they are in fact
+ 	 * enabled.. someone messed up their IRQ state tracing.
+ 	 */
+-	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++	if (DEBUG_LOCKS_WARN_ON(!lockdep_stage_disabled()))
+ 		return;
+ 
+ 	/*
+@@ -4266,7 +4314,7 @@ void noinstr lockdep_hardirqs_on(unsigned long ip)
+ 	 * already enabled, yet we find the hardware thinks they are in fact
+ 	 * enabled.. someone messed up their IRQ state tracing.
+ 	 */
+-	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++	if (DEBUG_LOCKS_WARN_ON(!lockdep_stage_disabled()))
+ 		return;
+ 
+ 	/*
+@@ -4308,7 +4356,7 @@ void noinstr lockdep_hardirqs_off(unsigned long ip)
+ 	 * So we're supposed to get called after you mask local IRQs, but for
+ 	 * some reason the hardware doesn't quite think you did a proper job.
+ 	 */
+-	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++	if (DEBUG_LOCKS_WARN_ON(!lockdep_stage_disabled()))
+ 		return;
+ 
+ 	if (lockdep_hardirqs_enabled()) {
+@@ -4341,7 +4389,7 @@ void lockdep_softirqs_on(unsigned long ip)
+ 	 * We fancy IRQs being disabled here, see softirq.c, avoids
+ 	 * funny state and nesting things.
+ 	 */
+-	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++	if (DEBUG_LOCKS_WARN_ON(!lockdep_stage_disabled()))
+ 		return;
+ 
+ 	if (current->softirqs_enabled) {
+@@ -4378,7 +4426,7 @@ void lockdep_softirqs_off(unsigned long ip)
+ 	/*
+ 	 * We fancy IRQs being disabled here, see softirq.c
+ 	 */
+-	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++	if (DEBUG_LOCKS_WARN_ON(!lockdep_stage_disabled()))
+ 		return;
+ 
+ 	if (current->softirqs_enabled) {
+@@ -5085,7 +5133,7 @@ static int reacquire_held_locks(struct task_struct *curr, unsigned int depth,
+ 	struct held_lock *hlock;
+ 	int first_idx = idx;
+ 
+-	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++	if (DEBUG_LOCKS_WARN_ON(!lockdep_stage_disabled()))
+ 		return 0;
+ 
+ 	for (hlock = curr->held_locks + idx; idx < depth; idx++, hlock++) {
+@@ -5397,7 +5445,13 @@ static void __lock_unpin_lock(struct lockdep_map *lock, struct pin_cookie cookie
+ static noinstr void check_flags(unsigned long flags)
+ {
+ #if defined(CONFIG_PROVE_LOCKING) && defined(CONFIG_DEBUG_LOCKDEP)
+-	if (!debug_locks)
++	/*
++	 * irq_pipeline: we can't and don't want to check the
++	 * consistency of the irq tracer when running over the
++	 * pipeline entry or oob stage contexts, since the inband
++	 * stall bit does not reflect the current irq state there.
++	 */
++	if (on_pipeline_entry() || running_oob() || !debug_locks)
+ 		return;
+ 
+ 	/* Get the warning out..  */
+@@ -5532,6 +5586,7 @@ void lock_acquire(struct lockdep_map *lock, unsigned int subclass,
+ 			  struct lockdep_map *nest_lock, unsigned long ip)
+ {
+ 	unsigned long flags;
++	int irqsoff;
+ 
+ 	trace_lock_acquire(lock, subclass, trylock, read, check, nest_lock, ip);
+ 
+@@ -5558,14 +5613,14 @@ void lock_acquire(struct lockdep_map *lock, unsigned int subclass,
+ 		return;
+ 	}
+ 
+-	raw_local_irq_save(flags);
++	flags = lockdep_stage_test_and_disable(&irqsoff);
+ 	check_flags(flags);
+ 
+ 	lockdep_recursion_inc();
+ 	__lock_acquire(lock, subclass, trylock, read, check,
+-		       irqs_disabled_flags(flags), nest_lock, ip, 0, 0);
++		       irqsoff, nest_lock, ip, 0, 0);
+ 	lockdep_recursion_finish();
+-	raw_local_irq_restore(flags);
++	lockdep_stage_restore(flags);
+ }
+ EXPORT_SYMBOL_GPL(lock_acquire);
+ 
+@@ -5578,14 +5633,14 @@ void lock_release(struct lockdep_map *lock, unsigned long ip)
+ 	if (unlikely(!lockdep_enabled()))
+ 		return;
+ 
+-	raw_local_irq_save(flags);
++	flags = lockdep_stage_disable();
+ 	check_flags(flags);
+ 
+ 	lockdep_recursion_inc();
+ 	if (__lock_release(lock, ip))
+ 		check_chain_key(current);
+ 	lockdep_recursion_finish();
+-	raw_local_irq_restore(flags);
++	lockdep_stage_restore(flags);
+ }
+ EXPORT_SYMBOL_GPL(lock_release);
+ 
+@@ -5597,13 +5652,13 @@ noinstr int lock_is_held_type(const struct lockdep_map *lock, int read)
+ 	if (unlikely(!lockdep_enabled()))
+ 		return 1; /* avoid false negative lockdep_assert_held() */
+ 
+-	raw_local_irq_save(flags);
++	flags = lockdep_stage_disable();
+ 	check_flags(flags);
+ 
+ 	lockdep_recursion_inc();
+ 	ret = __lock_is_held(lock, read);
+ 	lockdep_recursion_finish();
+-	raw_local_irq_restore(flags);
++	lockdep_stage_restore(flags);
+ 
+ 	return ret;
+ }
+@@ -5790,12 +5845,12 @@ void lock_contended(struct lockdep_map *lock, unsigned long ip)
+ 	if (unlikely(!lock_stat || !lockdep_enabled()))
+ 		return;
+ 
+-	raw_local_irq_save(flags);
++	flags = lockdep_stage_disable();
+ 	check_flags(flags);
+ 	lockdep_recursion_inc();
+ 	__lock_contended(lock, ip);
+ 	lockdep_recursion_finish();
+-	raw_local_irq_restore(flags);
++	lockdep_stage_restore(flags);
+ }
+ EXPORT_SYMBOL_GPL(lock_contended);
+ 
+@@ -5808,12 +5863,12 @@ void lock_acquired(struct lockdep_map *lock, unsigned long ip)
+ 	if (unlikely(!lock_stat || !lockdep_enabled()))
+ 		return;
+ 
+-	raw_local_irq_save(flags);
++	flags = lockdep_stage_disable();
+ 	check_flags(flags);
+ 	lockdep_recursion_inc();
+ 	__lock_acquired(lock, ip);
+ 	lockdep_recursion_finish();
+-	raw_local_irq_restore(flags);
++	lockdep_stage_restore(flags);
+ }
+ EXPORT_SYMBOL_GPL(lock_acquired);
+ #endif
+@@ -6342,7 +6397,7 @@ void debug_check_no_locks_freed(const void *mem_from, unsigned long mem_len)
+ 	if (unlikely(!debug_locks))
+ 		return;
+ 
+-	raw_local_irq_save(flags);
++	flags = lockdep_stage_disable();
+ 	for (i = 0; i < curr->lockdep_depth; i++) {
+ 		hlock = curr->held_locks + i;
+ 
+@@ -6353,7 +6408,7 @@ void debug_check_no_locks_freed(const void *mem_from, unsigned long mem_len)
+ 		print_freed_lock_bug(curr, mem_from, mem_from + mem_len, hlock);
+ 		break;
+ 	}
+-	raw_local_irq_restore(flags);
++	lockdep_stage_restore(flags);
+ }
+ EXPORT_SYMBOL_GPL(debug_check_no_locks_freed);
+ 
+diff --git a/kernel/locking/lockdep_internals.h b/kernel/locking/lockdep_internals.h
+index bbe900026..6f78acc29 100644
+--- a/kernel/locking/lockdep_internals.h
++++ b/kernel/locking/lockdep_internals.h
+@@ -213,12 +213,12 @@ DECLARE_PER_CPU(struct lockdep_stats, lockdep_stats);
+ 	this_cpu_inc(lockdep_stats.ptr);
+ 
+ #define debug_atomic_inc(ptr)			{		\
+-	WARN_ON_ONCE(!irqs_disabled());				\
++	WARN_ON_ONCE(!hard_irqs_disabled() && !irqs_disabled());\
+ 	__this_cpu_inc(lockdep_stats.ptr);			\
+ }
+ 
+ #define debug_atomic_dec(ptr)			{		\
+-	WARN_ON_ONCE(!irqs_disabled());				\
++	WARN_ON_ONCE(!hard_irqs_disabled() && !irqs_disabled());\
+ 	__this_cpu_dec(lockdep_stats.ptr);			\
+ }
+ 
+diff --git a/kernel/locking/pipeline.c b/kernel/locking/pipeline.c
+new file mode 100644
+index 000000000..ba1b6987d
+--- /dev/null
++++ b/kernel/locking/pipeline.c
+@@ -0,0 +1,226 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright (C) 2016 Philippe Gerum  <rpm@xenomai.org>.
++ */
++#include <linux/linkage.h>
++#include <linux/preempt.h>
++#include <linux/spinlock.h>
++#include <linux/interrupt.h>
++#include <linux/irq_pipeline.h>
++#include <linux/kconfig.h>
++
++/*
++ * A hybrid spinlock behaves in different ways depending on the
++ * current interrupt stage on entry.
++ *
++ * Such spinlock always leaves hard IRQs disabled once locked. In
++ * addition, it stalls the in-band stage when protecting a critical
++ * section there, disabling preemption like regular spinlocks do as
++ * well. This combination preserves the regular locking logic when
++ * called from the in-band stage, while fully disabling preemption by
++ * other interrupt stages.
++ *
++ * When taken from the pipeline entry context, a hybrid lock behaves
++ * like a hard spinlock, assuming that hard IRQs are already disabled.
++ *
++ * The irq descriptor lock (struct irq_desc) is a typical example of
++ * such lock, which properly serializes accesses regardless of the
++ * calling context.
++ */
++void __hybrid_spin_lock(struct raw_spinlock *rlock)
++{
++	struct hybrid_spinlock *lock;
++	unsigned long __flags;
++
++	if (running_inband())
++		preempt_disable();
++
++	__flags = hard_local_irq_save();
++	hard_lock_acquire(rlock, 0, _RET_IP_);
++	lock = container_of(rlock, struct hybrid_spinlock, rlock);
++	lock->hwflags = __flags;
++}
++EXPORT_SYMBOL(__hybrid_spin_lock);
++
++void __hybrid_spin_lock_nested(struct raw_spinlock *rlock, int subclass)
++{
++	struct hybrid_spinlock *lock;
++	unsigned long __flags;
++
++	if (running_inband())
++		preempt_disable();
++
++	__flags = hard_local_irq_save();
++	hard_lock_acquire_nested(rlock, subclass, _RET_IP_);
++	lock = container_of(rlock, struct hybrid_spinlock, rlock);
++	lock->hwflags = __flags;
++}
++EXPORT_SYMBOL(__hybrid_spin_lock_nested);
++
++void __hybrid_spin_unlock(struct raw_spinlock *rlock)
++{
++	struct hybrid_spinlock *lock;
++	unsigned long __flags;
++
++	/* Pick the flags before releasing the lock. */
++	lock = container_of(rlock, struct hybrid_spinlock, rlock);
++	__flags = lock->hwflags;
++	hard_lock_release(rlock, _RET_IP_);
++	hard_local_irq_restore(__flags);
++
++	if (running_inband())
++		preempt_enable();
++}
++EXPORT_SYMBOL(__hybrid_spin_unlock);
++
++void __hybrid_spin_lock_irq(struct raw_spinlock *rlock)
++{
++	struct hybrid_spinlock *lock;
++	unsigned long __flags;
++
++	__flags = hard_local_irq_save();
++
++	if (running_inband()) {
++		stall_inband();
++		trace_hardirqs_off();
++		preempt_disable();
++	}
++
++	hard_lock_acquire(rlock, 0, _RET_IP_);
++	lock = container_of(rlock, struct hybrid_spinlock, rlock);
++	lock->hwflags = __flags;
++}
++EXPORT_SYMBOL(__hybrid_spin_lock_irq);
++
++void __hybrid_spin_unlock_irq(struct raw_spinlock *rlock)
++{
++	struct hybrid_spinlock *lock;
++	unsigned long __flags;
++
++	/* Pick the flags before releasing the lock. */
++	lock = container_of(rlock, struct hybrid_spinlock, rlock);
++	__flags = lock->hwflags;
++	hard_lock_release(rlock, _RET_IP_);
++
++	if (running_inband()) {
++		trace_hardirqs_on();
++		unstall_inband_nocheck();
++		hard_local_irq_restore(__flags);
++		preempt_enable();
++		return;
++	}
++
++	hard_local_irq_restore(__flags);
++}
++EXPORT_SYMBOL(__hybrid_spin_unlock_irq);
++
++unsigned long __hybrid_spin_lock_irqsave(struct raw_spinlock *rlock)
++{
++	struct hybrid_spinlock *lock;
++	unsigned long __flags, flags;
++
++	__flags = flags = hard_local_irq_save();
++
++	if (running_inband()) {
++		flags = test_and_stall_inband();
++		trace_hardirqs_off();
++		preempt_disable();
++	}
++
++	hard_lock_acquire(rlock, 0, _RET_IP_);
++	lock = container_of(rlock, struct hybrid_spinlock, rlock);
++	lock->hwflags = __flags;
++
++	return flags;
++}
++EXPORT_SYMBOL(__hybrid_spin_lock_irqsave);
++
++void __hybrid_spin_unlock_irqrestore(struct raw_spinlock *rlock,
++				      unsigned long flags)
++{
++	struct hybrid_spinlock *lock;
++	unsigned long __flags;
++
++	/* Pick the flags before releasing the lock. */
++	lock = container_of(rlock, struct hybrid_spinlock, rlock);
++	__flags = lock->hwflags;
++	hard_lock_release(rlock, _RET_IP_);
++
++	if (running_inband()) {
++		if (!flags) {
++			trace_hardirqs_on();
++			unstall_inband_nocheck();
++		}
++		hard_local_irq_restore(__flags);
++		preempt_enable();
++		return;
++	}
++
++	hard_local_irq_restore(__flags);
++}
++EXPORT_SYMBOL(__hybrid_spin_unlock_irqrestore);
++
++int __hybrid_spin_trylock(struct raw_spinlock *rlock)
++{
++	struct hybrid_spinlock *lock;
++	unsigned long __flags;
++
++	if (running_inband())
++		preempt_disable();
++
++	lock = container_of(rlock, struct hybrid_spinlock, rlock);
++	__flags = hard_local_irq_save();
++
++	if (do_raw_spin_trylock(rlock)) {
++		lock->hwflags = __flags;
++		hard_trylock_acquire(rlock, 1, _RET_IP_);
++		return 1;
++	}
++
++	hard_local_irq_restore(__flags);
++
++	if (running_inband())
++		preempt_enable();
++
++	return 0;
++}
++EXPORT_SYMBOL(__hybrid_spin_trylock);
++
++int __hybrid_spin_trylock_irqsave(struct raw_spinlock *rlock,
++				   unsigned long *flags)
++{
++	struct hybrid_spinlock *lock;
++	unsigned long __flags;
++	bool inband;
++
++	inband = running_inband();
++
++	__flags = *flags = hard_local_irq_save();
++
++	lock = container_of(rlock, struct hybrid_spinlock, rlock);
++	if (inband) {
++		*flags = test_and_stall_inband();
++		trace_hardirqs_off();
++		preempt_disable();
++	}
++
++	if (do_raw_spin_trylock(rlock)) {
++		hard_trylock_acquire(rlock, 1, _RET_IP_);
++		lock->hwflags = __flags;
++		return 1;
++	}
++
++	if (inband && !*flags) {
++		trace_hardirqs_on();
++		unstall_inband_nocheck();
++	}
++
++	hard_local_irq_restore(__flags);
++
++	if (inband)
++		preempt_enable();
++
++	return 0;
++}
++EXPORT_SYMBOL(__hybrid_spin_trylock_irqsave);
+diff --git a/kernel/locking/spinlock_debug.c b/kernel/locking/spinlock_debug.c
+index b9d93087e..0bcc39f5b 100644
+--- a/kernel/locking/spinlock_debug.c
++++ b/kernel/locking/spinlock_debug.c
+@@ -114,6 +114,7 @@ void do_raw_spin_lock(raw_spinlock_t *lock)
+ 	mmiowb_spin_lock();
+ 	debug_spin_lock_after(lock);
+ }
++EXPORT_SYMBOL_GPL(do_raw_spin_lock);
+ 
+ int do_raw_spin_trylock(raw_spinlock_t *lock)
+ {
+@@ -131,6 +132,7 @@ int do_raw_spin_trylock(raw_spinlock_t *lock)
+ #endif
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(do_raw_spin_trylock);
+ 
+ void do_raw_spin_unlock(raw_spinlock_t *lock)
+ {
+@@ -138,6 +140,7 @@ void do_raw_spin_unlock(raw_spinlock_t *lock)
+ 	debug_spin_unlock(lock);
+ 	arch_spin_unlock(&lock->raw_lock);
+ }
++EXPORT_SYMBOL_GPL(do_raw_spin_unlock);
+ 
+ static void rwlock_bug(rwlock_t *lock, const char *msg)
+ {
+diff --git a/kernel/panic.c b/kernel/panic.c
+index 332736a72..f4a05dd5a 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -27,6 +27,7 @@
+ #include <linux/sysrq.h>
+ #include <linux/init.h>
+ #include <linux/nmi.h>
++#include <linux/irq_pipeline.h>
+ #include <linux/console.h>
+ #include <linux/bug.h>
+ #include <linux/ratelimit.h>
+@@ -49,7 +50,7 @@ static unsigned long tainted_mask =
+ 	IS_ENABLED(CONFIG_GCC_PLUGIN_RANDSTRUCT) ? (1 << TAINT_RANDSTRUCT) : 0;
+ static int pause_on_oops;
+ static int pause_on_oops_flag;
+-static DEFINE_SPINLOCK(pause_on_oops_lock);
++static DEFINE_HARD_SPINLOCK(pause_on_oops_lock);
+ bool crash_kexec_post_notifiers;
+ int panic_on_warn __read_mostly;
+ unsigned long panic_on_taint;
+@@ -189,8 +190,9 @@ void panic(const char *fmt, ...)
+ 	 * there is nothing to prevent an interrupt handler (that runs
+ 	 * after setting panic_cpu) from invoking panic() again.
+ 	 */
+-	local_irq_disable();
++	hard_local_irq_disable();
+ 	preempt_disable_notrace();
++	irq_pipeline_oops();
+ 
+ 	/*
+ 	 * It's possible to come here directly from a panic-assertion and
+@@ -267,9 +269,12 @@ void panic(const char *fmt, ...)
+ 
+ 	/*
+ 	 * Run any panic handlers, including those that might need to
+-	 * add information to the kmsg dump output.
++	 * add information to the kmsg dump output. Skip panic
++	 * handlers if running over the oob stage, as they would most
++	 * likely break.
+ 	 */
+-	atomic_notifier_call_chain(&panic_notifier_list, 0, buf);
++	if (running_inband())
++		atomic_notifier_call_chain(&panic_notifier_list, 0, buf);
+ 
+ 	/* Call flush even twice. It tries harder with a single online CPU */
+ 	printk_safe_flush_on_panic();
+@@ -474,7 +479,7 @@ static void do_oops_enter_exit(void)
+ 	if (!pause_on_oops)
+ 		return;
+ 
+-	spin_lock_irqsave(&pause_on_oops_lock, flags);
++	raw_spin_lock_irqsave(&pause_on_oops_lock, flags);
+ 	if (pause_on_oops_flag == 0) {
+ 		/* This CPU may now print the oops message */
+ 		pause_on_oops_flag = 1;
+@@ -484,21 +489,21 @@ static void do_oops_enter_exit(void)
+ 			/* This CPU gets to do the counting */
+ 			spin_counter = pause_on_oops;
+ 			do {
+-				spin_unlock(&pause_on_oops_lock);
++				raw_spin_unlock(&pause_on_oops_lock);
+ 				spin_msec(MSEC_PER_SEC);
+-				spin_lock(&pause_on_oops_lock);
++				raw_spin_lock(&pause_on_oops_lock);
+ 			} while (--spin_counter);
+ 			pause_on_oops_flag = 0;
+ 		} else {
+ 			/* This CPU waits for a different one */
+ 			while (spin_counter) {
+-				spin_unlock(&pause_on_oops_lock);
++				raw_spin_unlock(&pause_on_oops_lock);
+ 				spin_msec(1);
+-				spin_lock(&pause_on_oops_lock);
++				raw_spin_lock(&pause_on_oops_lock);
+ 			}
+ 		}
+ 	}
+-	spin_unlock_irqrestore(&pause_on_oops_lock, flags);
++	raw_spin_unlock_irqrestore(&pause_on_oops_lock, flags);
+ }
+ 
+ /*
+@@ -528,6 +533,7 @@ void oops_enter(void)
+ {
+ 	tracing_off();
+ 	/* can't trust the integrity of the kernel anymore: */
++	irq_pipeline_oops();
+ 	debug_locks_off();
+ 	do_oops_enter_exit();
+ 
+diff --git a/kernel/power/hibernate.c b/kernel/power/hibernate.c
+index 522cb1387..483af7e8e 100644
+--- a/kernel/power/hibernate.c
++++ b/kernel/power/hibernate.c
+@@ -302,6 +302,7 @@ static int create_image(int platform_mode)
+ 		goto Enable_cpus;
+ 
+ 	local_irq_disable();
++	hard_cond_local_irq_disable();
+ 
+ 	system_state = SYSTEM_SUSPEND;
+ 
+@@ -469,6 +470,7 @@ static int resume_target_kernel(bool platform_mode)
+ 
+ 	local_irq_disable();
+ 	system_state = SYSTEM_SUSPEND;
++	hard_cond_local_irq_disable();
+ 
+ 	error = syscore_suspend();
+ 	if (error)
+@@ -590,6 +592,7 @@ int hibernation_platform_enter(void)
+ 
+ 	local_irq_disable();
+ 	system_state = SYSTEM_SUSPEND;
++	hard_cond_local_irq_disable();
+ 	syscore_suspend();
+ 	if (pm_wakeup_pending()) {
+ 		error = -EAGAIN;
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index dfeb62278..9ee11513b 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -47,6 +47,7 @@
+ #include <linux/sched/clock.h>
+ #include <linux/sched/debug.h>
+ #include <linux/sched/task_stack.h>
++#include <linux/irqstage.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/sections.h>
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index b41009a28..010a7f368 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -709,7 +709,11 @@ noinstr void rcu_nmi_exit(void)
+ {
+ 	struct rcu_data *rdp = this_cpu_ptr(&rcu_data);
+ 
++	if (running_oob())
++		return;
++
+ 	instrumentation_begin();
++
+ 	/*
+ 	 * Check for ->dynticks_nmi_nesting underflow and bad ->dynticks.
+ 	 * (We are exiting an NMI handler, so RCU better be paying attention
+@@ -983,6 +987,9 @@ noinstr void rcu_nmi_enter(void)
+ 	long incby = 2;
+ 	struct rcu_data *rdp = this_cpu_ptr(&rcu_data);
+ 
++	if (running_oob())
++		return;
++
+ 	/* Complain about underflow. */
+ 	WARN_ON_ONCE(rdp->dynticks_nmi_nesting < 0);
+ 
+@@ -1106,6 +1113,9 @@ notrace bool rcu_is_watching(void)
+ {
+ 	bool ret;
+ 
++	if (running_oob())
++		return true;
++
+ 	preempt_disable_notrace();
+ 	ret = !rcu_dynticks_curr_cpu_in_eqs();
+ 	preempt_enable_notrace();
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index da96a309e..4626296b9 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3121,6 +3121,9 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ #ifdef CONFIG_SMP
+ 	p->wake_entry.u_flags = CSD_TYPE_TTWU;
+ #endif
++#ifdef CONFIG_IRQ_PIPELINE
++	init_task_stall_bits(p);
++#endif
+ }
+ 
+ DEFINE_STATIC_KEY_FALSE(sched_numa_balancing);
+@@ -3571,6 +3574,7 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
+ 	rseq_preempt(prev);
+ 	fire_sched_out_preempt_notifiers(prev, next);
+ 	prepare_task(next);
++	hard_cond_local_irq_disable();
+ 	prepare_arch_switch(next);
+ }
+ 
+@@ -3729,6 +3733,8 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
+ 	 * PREEMPT_COUNT kernels).
+ 	 */
+ 
++	WARN_ON_ONCE(irq_pipeline_debug() && !irqs_disabled());
++	hard_cond_local_irq_enable();
+ 	rq = finish_task_switch(prev);
+ 	balance_callback(rq);
+ 	preempt_enable();
+@@ -4300,6 +4306,8 @@ static inline void schedule_debug(struct task_struct *prev, bool preempt)
+ 		panic("corrupted shadow stack detected inside scheduler\n");
+ #endif
+ 
++	check_inband_stage();
++
+ #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+ 	if (!preempt && prev->state && prev->non_block_count) {
+ 		printk(KERN_ERR "BUG: scheduling in a non-blocking section: %s/%d/%i\n",
+@@ -4724,7 +4732,7 @@ asmlinkage __visible void __sched notrace preempt_schedule(void)
+ 	 * If there is a non-zero preempt_count or interrupts are disabled,
+ 	 * we do not want to preempt the current task. Just return..
+ 	 */
+-	if (likely(!preemptible()))
++	if (likely(!running_inband() || !preemptible()))
+ 		return;
+ 
+ 	preempt_schedule_common();
+@@ -4750,7 +4758,7 @@ asmlinkage __visible void __sched notrace preempt_schedule_notrace(void)
+ {
+ 	enum ctx_state prev_ctx;
+ 
+-	if (likely(!preemptible()))
++	if (likely(!running_inband() || !preemptible()))
+ 		return;
+ 
+ 	do {
+@@ -4791,23 +4799,41 @@ EXPORT_SYMBOL_GPL(preempt_schedule_notrace);
+  * off of irq context.
+  * Note, that this is called and return with irqs disabled. This will
+  * protect us against recursive calling from irq.
++ *
++ * IRQ pipeline: we are called with hard irqs off, synchronize the
++ * pipeline then return the same way, so that the in-band log is
++ * guaranteed empty and further interrupt delivery is postponed by the
++ * hardware until have exited the kernel.
+  */
+ asmlinkage __visible void __sched preempt_schedule_irq(void)
+ {
+ 	enum ctx_state prev_state;
+ 
++	if (irq_pipeline_debug()) {
++		/* Catch any weirdness in pipelined entry code. */
++		if (WARN_ON_ONCE(!running_inband()))
++			return;
++		WARN_ON_ONCE(!hard_irqs_disabled());
++	}
++
++	hard_cond_local_irq_enable();
++
+ 	/* Catch callers which need to be fixed */
+ 	BUG_ON(preempt_count() || !irqs_disabled());
+ 
+ 	prev_state = exception_enter();
+ 
+-	do {
++	for (;;) {
+ 		preempt_disable();
+ 		local_irq_enable();
+ 		__schedule(true);
++		sync_inband_irqs();
+ 		local_irq_disable();
+ 		sched_preempt_enable_no_resched();
+-	} while (need_resched());
++		if (!need_resched())
++			break;
++		hard_cond_local_irq_enable();
++	}
+ 
+ 	exception_exit(prev_state);
+ }
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index 2593a733c..8cafa81e7 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -78,6 +78,7 @@ void __weak arch_cpu_idle_dead(void) { }
+ void __weak arch_cpu_idle(void)
+ {
+ 	cpu_idle_force_poll = 1;
++	hard_local_irq_enable();
+ 	raw_local_irq_enable();
+ }
+ 
+@@ -85,13 +86,18 @@ void __weak arch_cpu_idle(void)
+  * default_idle_call - Default CPU idle routine.
+  *
+  * To use when the cpuidle framework cannot be used.
++ *
++ * When interrupts are pipelined, this call is entered with hard irqs
++ * on and the in-band stage is stalled. Returns with hard irqs on,
++ * in-band stage stalled. irq_cpuidle_enter() then turns off hard irqs
++ * before synchronizing irqs, making sure we have no event lingering
++ * in the interrupt log as we go for a nap.
+  */
+ void __cpuidle default_idle_call(void)
+ {
+ 	if (current_clr_polling_and_test()) {
+-		local_irq_enable();
+-	} else {
+-
++		local_irq_enable_full();
++	} else if (irq_cpuidle_enter(NULL, NULL)) { /* hard irqs off now */
+ 		trace_cpu_idle(1, smp_processor_id());
+ 		stop_critical_timings();
+ 
+@@ -125,6 +131,8 @@ void __cpuidle default_idle_call(void)
+ 
+ 		start_critical_timings();
+ 		trace_cpu_idle(PWR_EVENT_EXIT, smp_processor_id());
++	} else {
++		local_irq_enable_full();
+ 	}
+ }
+ 
+@@ -246,6 +254,13 @@ static void cpuidle_idle_call(void)
+ exit_idle:
+ 	__current_set_polling();
+ 
++	/*
++	 *  Catch mishandling of the CPU's interrupt disable flag when
++	 *  pipelining IRQs.
++	 */
++	if (WARN_ON_ONCE(irq_pipeline_debug() && hard_irqs_disabled()))
++		hard_local_irq_enable();
++
+ 	/*
+ 	 * It is up to the idle functions to reenable local interrupts
+ 	 */
+@@ -298,6 +313,7 @@ static void do_idle(void)
+ 			cpu_idle_poll();
+ 		} else {
+ 			cpuidle_idle_call();
++			WARN_ON_ONCE(irq_pipeline_debug() && hard_irqs_disabled());
+ 		}
+ 		arch_cpu_idle_exit();
+ 	}
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 12c656288..e16299b67 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -52,6 +52,7 @@
+ #include <linux/membarrier.h>
+ #include <linux/migrate.h>
+ #include <linux/mmu_context.h>
++#include <linux/irq_pipeline.h>
+ #include <linux/nmi.h>
+ #include <linux/proc_fs.h>
+ #include <linux/prefetch.h>
+diff --git a/kernel/sched/wait.c b/kernel/sched/wait.c
+index a55642aa3..99ca51a38 100644
+--- a/kernel/sched/wait.c
++++ b/kernel/sched/wait.c
+@@ -70,6 +70,8 @@ static int __wake_up_common(struct wait_queue_head *wq_head, unsigned int mode,
+ 	wait_queue_entry_t *curr, *next;
+ 	int cnt = 0;
+ 
++	check_inband_stage();
++
+ 	lockdep_assert_held(&wq_head->lock);
+ 
+ 	if (bookmark && (bookmark->flags & WQ_FLAG_BOOKMARK)) {
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index ce796ca86..5661f0912 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -890,6 +890,16 @@ config DEBUG_SHIRQ
+ 	  is currently disabled). Drivers need to handle this correctly. Some
+ 	  don't and need to be caught.
+ 
++config DEBUG_IRQ_PIPELINE
++	bool "Debug IRQ pipeline"
++	depends on IRQ_PIPELINE && DEBUG_KERNEL
++	help
++	  Turn on this option for enabling debug checks related to
++	  interrupt pipelining, like interrupt state consistency and
++	  proper context isolation between the in-band and oob stages.
++
++	  If unsure, say N.
++
+ menu "Debug Oops, Lockups and Hangs"
+ 
+ config PANIC_ON_OOPS
+@@ -1297,6 +1307,27 @@ config DEBUG_LOCK_ALLOC
+ 	 spin_lock_init()/mutex_init()/etc., or whether there is any lock
+ 	 held during task exit.
+ 
++config DEBUG_HARD_LOCKS
++	bool "Debug hard spinlocks"
++	depends on DEBUG_IRQ_PIPELINE && LOCKDEP && EXPERIMENTAL
++	help
++	  Turn on this option for enabling LOCKDEP for hard spinlock
++	  types used in interrupt pipelining.
++
++	  Keep in mind that enabling such feature will ruin the
++	  latency figures for any out-of-band code, this is merely
++	  useful for proving the correctness of the locking scheme of
++	  such code without any consideration for real-time
++	  guarantees. You have been warned.
++
++	  If unsure, say N.
++
++if DEBUG_HARD_LOCKS
++comment "WARNING! DEBUG_HARD_LOCKS induces **massive** latency"
++comment "overhead for the code running on the out-of-band"
++comment "interrupt stage."
++endif
++
+ config LOCKDEP
+ 	bool
+ 	depends on DEBUG_KERNEL && LOCK_DEBUGGING_SUPPORT
+diff --git a/lib/atomic64.c b/lib/atomic64.c
+index e98c85a99..bf7d0409e 100644
+--- a/lib/atomic64.c
++++ b/lib/atomic64.c
+@@ -25,15 +25,15 @@
+  * Ensure each lock is in a separate cacheline.
+  */
+ static union {
+-	raw_spinlock_t lock;
++	hard_spinlock_t lock;
+ 	char pad[L1_CACHE_BYTES];
+ } atomic64_lock[NR_LOCKS] __cacheline_aligned_in_smp = {
+ 	[0 ... (NR_LOCKS - 1)] = {
+-		.lock =  __RAW_SPIN_LOCK_UNLOCKED(atomic64_lock.lock),
++		.lock =  __HARD_SPIN_LOCK_INITIALIZER(atomic64_lock.lock),
+ 	},
+ };
+ 
+-static inline raw_spinlock_t *lock_addr(const atomic64_t *v)
++static inline hard_spinlock_t *lock_addr(const atomic64_t *v)
+ {
+ 	unsigned long addr = (unsigned long) v;
+ 
+@@ -45,7 +45,7 @@ static inline raw_spinlock_t *lock_addr(const atomic64_t *v)
+ s64 atomic64_read(const atomic64_t *v)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	hard_spinlock_t *lock = lock_addr(v);
+ 	s64 val;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+@@ -58,7 +58,7 @@ EXPORT_SYMBOL(atomic64_read);
+ void atomic64_set(atomic64_t *v, s64 i)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	hard_spinlock_t *lock = lock_addr(v);
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+ 	v->counter = i;
+@@ -70,7 +70,7 @@ EXPORT_SYMBOL(atomic64_set);
+ void atomic64_##op(s64 a, atomic64_t *v)				\
+ {									\
+ 	unsigned long flags;						\
+-	raw_spinlock_t *lock = lock_addr(v);				\
++	hard_spinlock_t *lock = lock_addr(v);				\
+ 									\
+ 	raw_spin_lock_irqsave(lock, flags);				\
+ 	v->counter c_op a;						\
+@@ -82,7 +82,7 @@ EXPORT_SYMBOL(atomic64_##op);
+ s64 atomic64_##op##_return(s64 a, atomic64_t *v)			\
+ {									\
+ 	unsigned long flags;						\
+-	raw_spinlock_t *lock = lock_addr(v);				\
++	hard_spinlock_t *lock = lock_addr(v);				\
+ 	s64 val;							\
+ 									\
+ 	raw_spin_lock_irqsave(lock, flags);				\
+@@ -96,7 +96,7 @@ EXPORT_SYMBOL(atomic64_##op##_return);
+ s64 atomic64_fetch_##op(s64 a, atomic64_t *v)				\
+ {									\
+ 	unsigned long flags;						\
+-	raw_spinlock_t *lock = lock_addr(v);				\
++	hard_spinlock_t *lock = lock_addr(v);				\
+ 	s64 val;							\
+ 									\
+ 	raw_spin_lock_irqsave(lock, flags);				\
+@@ -133,7 +133,7 @@ ATOMIC64_OPS(xor, ^=)
+ s64 atomic64_dec_if_positive(atomic64_t *v)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	hard_spinlock_t *lock = lock_addr(v);
+ 	s64 val;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+@@ -148,7 +148,7 @@ EXPORT_SYMBOL(atomic64_dec_if_positive);
+ s64 atomic64_cmpxchg(atomic64_t *v, s64 o, s64 n)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	hard_spinlock_t *lock = lock_addr(v);
+ 	s64 val;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+@@ -163,7 +163,7 @@ EXPORT_SYMBOL(atomic64_cmpxchg);
+ s64 atomic64_xchg(atomic64_t *v, s64 new)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	hard_spinlock_t *lock = lock_addr(v);
+ 	s64 val;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+@@ -177,7 +177,7 @@ EXPORT_SYMBOL(atomic64_xchg);
+ s64 atomic64_fetch_add_unless(atomic64_t *v, s64 a, s64 u)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	hard_spinlock_t *lock = lock_addr(v);
+ 	s64 val;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+diff --git a/lib/dump_stack.c b/lib/dump_stack.c
+index a00ee6eed..351c6b6fb 100644
+--- a/lib/dump_stack.c
++++ b/lib/dump_stack.c
+@@ -9,9 +9,11 @@
+ #include <linux/sched.h>
+ #include <linux/sched/debug.h>
+ #include <linux/smp.h>
++#include <linux/irqstage.h>
+ #include <linux/atomic.h>
+ #include <linux/kexec.h>
+ #include <linux/utsname.h>
++#include <linux/hardirq.h>
+ 
+ static char dump_stack_arch_desc_str[128];
+ 
+@@ -56,6 +58,11 @@ void dump_stack_print_info(const char *log_lvl)
+ 		printk("%sHardware name: %s\n",
+ 		       log_lvl, dump_stack_arch_desc_str);
+ 
++#ifdef CONFIG_IRQ_PIPELINE
++	printk("%sIRQ stage: %s\n",
++	       log_lvl, current_irq_stage->name);
++#endif
++
+ 	print_worker_info(log_lvl, current);
+ }
+ 
+@@ -85,6 +92,29 @@ static void __dump_stack(void)
+ #ifdef CONFIG_SMP
+ static atomic_t dump_lock = ATOMIC_INIT(-1);
+ 
++static unsigned long disable_local_irqs(void)
++{
++	unsigned long flags = 0; /* only to trick the UMR detection */
++
++	/*
++	 * We neither need nor want to disable in-band IRQs over the
++	 * oob stage, where CPU migration can't happen. Conversely, we
++	 * neither need nor want to disable hard IRQs from the oob
++	 * stage, so that latency won't skyrocket as a result of
++	 * dumping the stack backtrace.
++	 */
++	if (running_inband() && !on_pipeline_entry())
++		local_irq_save(flags);
++
++	return flags;
++}
++
++static void restore_local_irqs(unsigned long flags)
++{
++	if (running_inband() && !on_pipeline_entry())
++		local_irq_restore(flags);
++}
++
+ asmlinkage __visible void dump_stack(void)
+ {
+ 	unsigned long flags;
+@@ -97,7 +127,7 @@ asmlinkage __visible void dump_stack(void)
+ 	 * against other CPUs
+ 	 */
+ retry:
+-	local_irq_save(flags);
++	flags = disable_local_irqs();
+ 	cpu = smp_processor_id();
+ 	old = atomic_cmpxchg(&dump_lock, -1, cpu);
+ 	if (old == -1) {
+@@ -105,7 +135,7 @@ asmlinkage __visible void dump_stack(void)
+ 	} else if (old == cpu) {
+ 		was_locked = 1;
+ 	} else {
+-		local_irq_restore(flags);
++		restore_local_irqs(flags);
+ 		/*
+ 		 * Wait for the lock to release before jumping to
+ 		 * atomic_cmpxchg() in order to mitigate the thundering herd
+@@ -120,7 +150,7 @@ asmlinkage __visible void dump_stack(void)
+ 	if (!was_locked)
+ 		atomic_set(&dump_lock, -1);
+ 
+-	local_irq_restore(flags);
++	restore_local_irqs(flags);
+ }
+ #else
+ asmlinkage __visible void dump_stack(void)
+diff --git a/lib/smp_processor_id.c b/lib/smp_processor_id.c
+index 2916606a9..952e2ad9a 100644
+--- a/lib/smp_processor_id.c
++++ b/lib/smp_processor_id.c
+@@ -7,12 +7,16 @@
+ #include <linux/export.h>
+ #include <linux/kprobes.h>
+ #include <linux/sched.h>
++#include <linux/irqstage.h>
+ 
+ noinstr static
+ unsigned int check_preemption_disabled(const char *what1, const char *what2)
+ {
+ 	int this_cpu = raw_smp_processor_id();
+ 
++	if (hard_irqs_disabled() || !running_inband())
++		goto out;
++
+ 	if (likely(preempt_count()))
+ 		goto out;
+ 
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 7ea0aee0c..b1124224b 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -41,7 +41,7 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ {
+ 	pte_t *pte, oldpte;
+ 	spinlock_t *ptl;
+-	unsigned long pages = 0;
++	unsigned long pages = 0, flags;
+ 	int target_node = NUMA_NO_NODE;
+ 	bool dirty_accountable = cp_flags & MM_CP_DIRTY_ACCT;
+ 	bool prot_numa = cp_flags & MM_CP_PROT_NUMA;
+@@ -113,6 +113,7 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 					continue;
+ 			}
+ 
++			flags = hard_local_irq_save();
+ 			oldpte = ptep_modify_prot_start(vma, addr, pte);
+ 			ptent = pte_modify(oldpte, newprot);
+ 			if (preserve_write)
+@@ -138,6 +139,7 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 				ptent = pte_mkwrite(ptent);
+ 			}
+ 			ptep_modify_prot_commit(vma, addr, pte, oldpte, ptent);
++			hard_local_irq_restore(flags);
+ 			pages++;
+ 		} else if (is_swap_pte(oldpte)) {
+ 			swp_entry_t entry = pte_to_swp_entry(oldpte);
+diff --git a/scripts/mkcompile_h b/scripts/mkcompile_h
+index a72b154de..5a34fe4b8 100755
+--- a/scripts/mkcompile_h
++++ b/scripts/mkcompile_h
+@@ -6,8 +6,9 @@ ARCH=$2
+ SMP=$3
+ PREEMPT=$4
+ PREEMPT_RT=$5
+-CC_VERSION="$6"
+-LD=$7
++IRQPIPE=$6
++CC_VERSION="$7"
++LD=$8
+ 
+ vecho() { [ "${quiet}" = "silent_" ] || echo "$@" ; }
+ 
+@@ -45,6 +46,7 @@ CONFIG_FLAGS=""
+ if [ -n "$SMP" ] ; then CONFIG_FLAGS="SMP"; fi
+ if [ -n "$PREEMPT" ] ; then CONFIG_FLAGS="$CONFIG_FLAGS PREEMPT"; fi
+ if [ -n "$PREEMPT_RT" ] ; then CONFIG_FLAGS="$CONFIG_FLAGS PREEMPT_RT"; fi
++if [ -n "$IRQPIPE" ] ; then CONFIG_FLAGS="$CONFIG_FLAGS IRQPIPE"; fi
+ 
+ # Truncate to maximum length
+ UTS_LEN=64
+-- 
+2.38.1
+

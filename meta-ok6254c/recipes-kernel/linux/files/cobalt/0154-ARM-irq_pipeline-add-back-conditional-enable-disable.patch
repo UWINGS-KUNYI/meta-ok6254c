@@ -1,0 +1,39 @@
+From ec4669d160bbf922b95f61c70c29ae38f5c4b679 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 27 Mar 2022 19:00:31 +0200
+Subject: [PATCH 154/179] ARM: irq_pipeline: add back conditional
+ {enable/disable}_irq
+
+This fixes a wreckage introduced during a recent merge.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm/include/asm/assembler.h | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/arch/arm/include/asm/assembler.h b/arch/arm/include/asm/assembler.h
+index a919b7eb0..9c66a0276 100644
+--- a/arch/arm/include/asm/assembler.h
++++ b/arch/arm/include/asm/assembler.h
+@@ -145,6 +145,18 @@
+ #endif
+ 	.endm
+ 
++	.macro  disable_irq_if_pipelined
++#ifdef CONFIG_IRQ_PIPELINE
++	disable_irq_notrace
++#endif
++	.endm
++
++	.macro  enable_irq_if_pipelined
++#ifdef CONFIG_IRQ_PIPELINE
++	enable_irq_notrace
++#endif
++	.endm
++
+ 	.macro disable_irq, save=1
+ 	disable_irq_notrace
+ 	asm_trace_hardirqs_off \save
+-- 
+2.38.1
+

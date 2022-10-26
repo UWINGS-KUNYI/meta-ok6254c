@@ -1,0 +1,45 @@
+From af09a35de6496f2444c6ea62c4adffb7fe944d11 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Mon, 1 Nov 2021 16:23:30 +0100
+Subject: [PATCH 142/179] ARM: dovetail: enable syscall_get_nr() beyond tracing
+
+Make sure syscall_get_nr() also works for the out-of-band core,
+provided the syscall was issued by the calling context. To this end,
+we update current_thread_info()->syscall with the raw syscall number
+received on SVC entry.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm/kernel/asm-offsets.c  | 1 +
+ arch/arm/kernel/entry-common.S | 3 +++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/arch/arm/kernel/asm-offsets.c b/arch/arm/kernel/asm-offsets.c
+index 60577f9cf..6dd7a8f96 100644
+--- a/arch/arm/kernel/asm-offsets.c
++++ b/arch/arm/kernel/asm-offsets.c
+@@ -43,6 +43,7 @@ int main(void)
+   BLANK();
+   DEFINE(TI_FLAGS,		offsetof(struct thread_info, flags));
+   DEFINE(TI_LOCAL_FLAGS,	offsetof(struct thread_info, local_flags));
++  DEFINE(TI_SYSCALL,		offsetof(struct thread_info, syscall));
+   DEFINE(TI_PREEMPT,		offsetof(struct thread_info, preempt_count));
+   DEFINE(TI_ADDR_LIMIT,		offsetof(struct thread_info, addr_limit));
+   DEFINE(TI_TASK,		offsetof(struct thread_info, task));
+diff --git a/arch/arm/kernel/entry-common.S b/arch/arm/kernel/entry-common.S
+index c2a090f68..7f187e634 100644
+--- a/arch/arm/kernel/entry-common.S
++++ b/arch/arm/kernel/entry-common.S
+@@ -274,6 +274,9 @@ ENTRY(vector_swi)
+ 	eor	scno, scno, #__NR_SYSCALL_BASE	@ check OS number
+ #endif
+ 	get_thread_info tsk
++#ifdef CONFIG_DOVETAIL
++	str	scno, [tsk, #TI_SYSCALL]
++#endif
+ 	/*
+ 	 * Reload the registers that may have been corrupted on entry to
+ 	 * the syscall assembly (by tracing or context tracking.)
+-- 
+2.38.1
+

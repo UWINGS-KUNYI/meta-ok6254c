@@ -1,0 +1,272 @@
+From b1e95e976840f14074e29dbfd6b9d6af84586ce7 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Fri, 25 Aug 2017 08:49:26 +0200
+Subject: [PATCH 029/179] drivers: irqchip: irq_pipeline: advertise immediate
+ readiness
+
+These irqchip drivers require no change in order to support the
+pipelined interrupt model. Just turn on the IRQ_PIPELINE_SAFE bit into
+their flags to advertise the capability.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/base/regmap/regmap-irq.c                  | 1 +
+ drivers/gpio/gpio-mxc.c                           | 3 ++-
+ drivers/gpio/gpio-zynq.c                          | 4 ++--
+ drivers/gpu/drm/msm/disp/dpu1/dpu_mdss.c          | 1 +
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_mdss.c         | 1 +
+ drivers/gpu/ipu-v3/ipu-common.c                   | 1 +
+ drivers/iio/industrialio-trigger.c                | 1 +
+ drivers/irqchip/irq-bcm2836.c                     | 3 +++
+ drivers/irqchip/irq-gic-v2m.c                     | 3 +++
+ drivers/irqchip/irq-gic-v3.c                      | 6 ++++--
+ drivers/irqchip/irq-sun4i.c                       | 2 +-
+ drivers/irqchip/irq-sunxi-nmi.c                   | 4 +++-
+ drivers/mfd/tps65217.c                            | 1 +
+ drivers/pci/controller/dwc/pcie-designware-host.c | 1 +
+ drivers/soc/qcom/smp2p.c                          | 1 +
+ 15 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/base/regmap/regmap-irq.c b/drivers/base/regmap/regmap-irq.c
+index 4466f8bda..ea1fc2ff2 100644
+--- a/drivers/base/regmap/regmap-irq.c
++++ b/drivers/base/regmap/regmap-irq.c
+@@ -331,6 +331,7 @@ static const struct irq_chip regmap_irq_chip = {
+ 	.irq_enable		= regmap_irq_enable,
+ 	.irq_set_type		= regmap_irq_set_type,
+ 	.irq_set_wake		= regmap_irq_set_wake,
++	.flags			= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static inline int read_sub_irq_data(struct regmap_irq_chip_data *data,
+diff --git a/drivers/gpio/gpio-mxc.c b/drivers/gpio/gpio-mxc.c
+index ba6ed2a41..96d523f48 100644
+--- a/drivers/gpio/gpio-mxc.c
++++ b/drivers/gpio/gpio-mxc.c
+@@ -361,7 +361,8 @@ static int mxc_gpio_init_gc(struct mxc_gpio_port *port, int irq_base)
+ 	ct->chip.irq_unmask = irq_gc_mask_set_bit;
+ 	ct->chip.irq_set_type = gpio_set_irq_type;
+ 	ct->chip.irq_set_wake = gpio_set_wake_irq;
+-	ct->chip.flags = IRQCHIP_MASK_ON_SUSPEND | IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND;
++	ct->chip.flags = IRQCHIP_MASK_ON_SUSPEND |
++		IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND | IRQCHIP_PIPELINE_SAFE;
+ 	ct->regs.ack = GPIO_ISR;
+ 	ct->regs.mask = GPIO_IMR;
+ 
+diff --git a/drivers/gpio/gpio-zynq.c b/drivers/gpio/gpio-zynq.c
+index c288a7502..28c02802a 100644
+--- a/drivers/gpio/gpio-zynq.c
++++ b/drivers/gpio/gpio-zynq.c
+@@ -601,7 +601,7 @@ static struct irq_chip zynq_gpio_level_irqchip = {
+ 	.irq_request_resources = zynq_gpio_irq_reqres,
+ 	.irq_release_resources = zynq_gpio_irq_relres,
+ 	.flags		= IRQCHIP_EOI_THREADED | IRQCHIP_EOI_IF_HANDLED |
+-			  IRQCHIP_MASK_ON_SUSPEND,
++			  IRQCHIP_MASK_ON_SUSPEND | IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static struct irq_chip zynq_gpio_edge_irqchip = {
+@@ -614,7 +614,7 @@ static struct irq_chip zynq_gpio_edge_irqchip = {
+ 	.irq_set_wake	= zynq_gpio_set_wake,
+ 	.irq_request_resources = zynq_gpio_irq_reqres,
+ 	.irq_release_resources = zynq_gpio_irq_relres,
+-	.flags		= IRQCHIP_MASK_ON_SUSPEND,
++	.flags		= IRQCHIP_MASK_ON_SUSPEND | IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static void zynq_gpio_handle_bank_irq(struct zynq_gpio *gpio,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_mdss.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_mdss.c
+index 96f3908e4..e82dda7e7 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_mdss.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_mdss.c
+@@ -94,6 +94,7 @@ static struct irq_chip dpu_mdss_irq_chip = {
+ 	.name = "dpu_mdss",
+ 	.irq_mask = dpu_mdss_irq_mask,
+ 	.irq_unmask = dpu_mdss_irq_unmask,
++	.flags = IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static struct lock_class_key dpu_mdss_lock_key, dpu_mdss_request_key;
+diff --git a/drivers/gpu/drm/msm/disp/mdp5/mdp5_mdss.c b/drivers/gpu/drm/msm/disp/mdp5/mdp5_mdss.c
+index 09bd46ad8..8e0f2be15 100644
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_mdss.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_mdss.c
+@@ -91,6 +91,7 @@ static struct irq_chip mdss_hw_irq_chip = {
+ 	.name		= "mdss",
+ 	.irq_mask	= mdss_hw_mask_irq,
+ 	.irq_unmask	= mdss_hw_unmask_irq,
++	.flags		= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static int mdss_hw_irqdomain_map(struct irq_domain *d, unsigned int irq,
+diff --git a/drivers/gpu/ipu-v3/ipu-common.c b/drivers/gpu/ipu-v3/ipu-common.c
+index d166ee262..6f4db392a 100644
+--- a/drivers/gpu/ipu-v3/ipu-common.c
++++ b/drivers/gpu/ipu-v3/ipu-common.c
+@@ -1238,6 +1238,7 @@ static int ipu_irq_init(struct ipu_soc *ipu)
+ 		ct->chip.irq_ack = irq_gc_ack_set_bit;
+ 		ct->chip.irq_mask = irq_gc_mask_clr_bit;
+ 		ct->chip.irq_unmask = irq_gc_mask_set_bit;
++		ct->chip.flags = IRQCHIP_PIPELINE_SAFE;
+ 		ct->regs.ack = IPU_INT_STAT(i / 32);
+ 		ct->regs.mask = IPU_INT_CTRL(i / 32);
+ 	}
+diff --git a/drivers/iio/industrialio-trigger.c b/drivers/iio/industrialio-trigger.c
+index 6bcc562d7..e9172bb27 100644
+--- a/drivers/iio/industrialio-trigger.c
++++ b/drivers/iio/industrialio-trigger.c
+@@ -544,6 +544,7 @@ struct iio_trigger *viio_trigger_alloc(const char *fmt, va_list vargs)
+ 	trig->subirq_chip.name = trig->name;
+ 	trig->subirq_chip.irq_mask = &iio_trig_subirqmask;
+ 	trig->subirq_chip.irq_unmask = &iio_trig_subirqunmask;
++	trig->subirq_chip.flags = IRQCHIP_PIPELINE_SAFE;
+ 	for (i = 0; i < CONFIG_IIO_CONSUMERS_PER_TRIGGER; i++) {
+ 		irq_set_chip(trig->subirq_base + i, &trig->subirq_chip);
+ 		irq_set_handler(trig->subirq_base + i, &handle_simple_irq);
+diff --git a/drivers/irqchip/irq-bcm2836.c b/drivers/irqchip/irq-bcm2836.c
+index cbc7c740e..89b47fc43 100644
+--- a/drivers/irqchip/irq-bcm2836.c
++++ b/drivers/irqchip/irq-bcm2836.c
+@@ -58,6 +58,7 @@ static struct irq_chip bcm2836_arm_irqchip_timer = {
+ 	.name		= "bcm2836-timer",
+ 	.irq_mask	= bcm2836_arm_irqchip_mask_timer_irq,
+ 	.irq_unmask	= bcm2836_arm_irqchip_unmask_timer_irq,
++	.flags		= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static void bcm2836_arm_irqchip_mask_pmu_irq(struct irq_data *d)
+@@ -74,6 +75,7 @@ static struct irq_chip bcm2836_arm_irqchip_pmu = {
+ 	.name		= "bcm2836-pmu",
+ 	.irq_mask	= bcm2836_arm_irqchip_mask_pmu_irq,
+ 	.irq_unmask	= bcm2836_arm_irqchip_unmask_pmu_irq,
++	.flags		= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static void bcm2836_arm_irqchip_mask_gpu_irq(struct irq_data *d)
+@@ -88,6 +90,7 @@ static struct irq_chip bcm2836_arm_irqchip_gpu = {
+ 	.name		= "bcm2836-gpu",
+ 	.irq_mask	= bcm2836_arm_irqchip_mask_gpu_irq,
+ 	.irq_unmask	= bcm2836_arm_irqchip_unmask_gpu_irq,
++	.flags		= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static void bcm2836_arm_irqchip_dummy_op(struct irq_data *d)
+diff --git a/drivers/irqchip/irq-gic-v2m.c b/drivers/irqchip/irq-gic-v2m.c
+index fbec07d63..c3f19ef14 100644
+--- a/drivers/irqchip/irq-gic-v2m.c
++++ b/drivers/irqchip/irq-gic-v2m.c
+@@ -89,6 +89,7 @@ static struct irq_chip gicv2m_msi_irq_chip = {
+ 	.irq_unmask		= gicv2m_unmask_msi_irq,
+ 	.irq_eoi		= irq_chip_eoi_parent,
+ 	.irq_write_msi_msg	= pci_msi_domain_write_msg,
++	.flags			= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static struct msi_domain_info gicv2m_msi_domain_info = {
+@@ -130,6 +131,7 @@ static struct irq_chip gicv2m_irq_chip = {
+ 	.irq_eoi		= irq_chip_eoi_parent,
+ 	.irq_set_affinity	= irq_chip_set_affinity_parent,
+ 	.irq_compose_msi_msg	= gicv2m_compose_msi_msg,
++	.flags			= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static int gicv2m_irq_gic_domain_alloc(struct irq_domain *domain,
+@@ -252,6 +254,7 @@ static bool is_msi_spi_valid(u32 base, u32 num)
+ 
+ static struct irq_chip gicv2m_pmsi_irq_chip = {
+ 	.name			= "pMSI",
++	.flags			= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static struct msi_domain_ops gicv2m_pmsi_ops = {
+diff --git a/drivers/irqchip/irq-gic-v3.c b/drivers/irqchip/irq-gic-v3.c
+index 4c8f18f0c..eaf0ef3e9 100644
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@ -1340,7 +1340,8 @@ static struct irq_chip gic_chip = {
+ 	.ipi_send_mask		= gic_ipi_send_mask,
+ 	.flags			= IRQCHIP_SET_TYPE_MASKED |
+ 				  IRQCHIP_SKIP_SET_WAKE |
+-				  IRQCHIP_MASK_ON_SUSPEND,
++				  IRQCHIP_MASK_ON_SUSPEND |
++				  IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static struct irq_chip gic_eoimode1_chip = {
+@@ -1359,7 +1360,8 @@ static struct irq_chip gic_eoimode1_chip = {
+ 	.ipi_send_mask		= gic_ipi_send_mask,
+ 	.flags			= IRQCHIP_SET_TYPE_MASKED |
+ 				  IRQCHIP_SKIP_SET_WAKE |
+-				  IRQCHIP_MASK_ON_SUSPEND,
++				  IRQCHIP_MASK_ON_SUSPEND |
++				  IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static int gic_irq_domain_map(struct irq_domain *d, unsigned int irq,
+diff --git a/drivers/irqchip/irq-sun4i.c b/drivers/irqchip/irq-sun4i.c
+index fb78d6623..4f5c42be1 100644
+--- a/drivers/irqchip/irq-sun4i.c
++++ b/drivers/irqchip/irq-sun4i.c
+@@ -87,7 +87,7 @@ static struct irq_chip sun4i_irq_chip = {
+ 	.irq_eoi	= sun4i_irq_ack,
+ 	.irq_mask	= sun4i_irq_mask,
+ 	.irq_unmask	= sun4i_irq_unmask,
+-	.flags		= IRQCHIP_EOI_THREADED | IRQCHIP_EOI_IF_HANDLED,
++	.flags		= IRQCHIP_EOI_THREADED | IRQCHIP_EOI_IF_HANDLED | IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static int sun4i_irq_map(struct irq_domain *d, unsigned int virq,
+diff --git a/drivers/irqchip/irq-sunxi-nmi.c b/drivers/irqchip/irq-sunxi-nmi.c
+index a412b5d5d..ada16f408 100644
+--- a/drivers/irqchip/irq-sunxi-nmi.c
++++ b/drivers/irqchip/irq-sunxi-nmi.c
+@@ -200,7 +200,9 @@ static int __init sunxi_sc_nmi_irq_init(struct device_node *node,
+ 	gc->chip_types[0].chip.irq_unmask	= irq_gc_mask_set_bit;
+ 	gc->chip_types[0].chip.irq_eoi		= irq_gc_ack_set_bit;
+ 	gc->chip_types[0].chip.irq_set_type	= sunxi_sc_nmi_set_type;
+-	gc->chip_types[0].chip.flags		= IRQCHIP_EOI_THREADED | IRQCHIP_EOI_IF_HANDLED;
++	gc->chip_types[0].chip.flags		= IRQCHIP_EOI_THREADED |
++									IRQCHIP_EOI_IF_HANDLED |
++									IRQCHIP_PIPELINE_SAFE;
+ 	gc->chip_types[0].regs.ack		= reg_offs->pend;
+ 	gc->chip_types[0].regs.mask		= reg_offs->enable;
+ 	gc->chip_types[0].regs.type		= reg_offs->ctrl;
+diff --git a/drivers/mfd/tps65217.c b/drivers/mfd/tps65217.c
+index 2d9c282ec..7987fea2d 100644
+--- a/drivers/mfd/tps65217.c
++++ b/drivers/mfd/tps65217.c
+@@ -84,6 +84,7 @@ static struct irq_chip tps65217_irq_chip = {
+ 	.irq_bus_sync_unlock	= tps65217_irq_sync_unlock,
+ 	.irq_enable		= tps65217_irq_enable,
+ 	.irq_disable		= tps65217_irq_disable,
++	.flags			= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static struct mfd_cell tps65217s[] = {
+diff --git a/drivers/pci/controller/dwc/pcie-designware-host.c b/drivers/pci/controller/dwc/pcie-designware-host.c
+index 42d8116a4..5bbea1e6d 100644
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -44,6 +44,7 @@ static struct irq_chip dw_pcie_msi_irq_chip = {
+ 	.irq_ack = dw_msi_ack_irq,
+ 	.irq_mask = dw_msi_mask_irq,
+ 	.irq_unmask = dw_msi_unmask_irq,
++	.flags = IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static struct msi_domain_info dw_pcie_msi_domain_info = {
+diff --git a/drivers/soc/qcom/smp2p.c b/drivers/soc/qcom/smp2p.c
+index fb76c8bc3..9eecb34ff 100644
+--- a/drivers/soc/qcom/smp2p.c
++++ b/drivers/soc/qcom/smp2p.c
+@@ -281,6 +281,7 @@ static struct irq_chip smp2p_irq_chip = {
+ 	.irq_mask       = smp2p_mask_irq,
+ 	.irq_unmask     = smp2p_unmask_irq,
+ 	.irq_set_type	= smp2p_set_irq_type,
++	.flags		= IRQCHIP_PIPELINE_SAFE,
+ };
+ 
+ static int smp2p_irq_map(struct irq_domain *d,
+-- 
+2.38.1
+

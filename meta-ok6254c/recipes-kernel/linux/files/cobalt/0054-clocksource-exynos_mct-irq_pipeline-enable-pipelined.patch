@@ -1,0 +1,69 @@
+From 87599ef3700e84dd76ba0f57d0f51e815abeb74d Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sat, 10 Oct 2020 19:44:52 +0200
+Subject: [PATCH 054/179] clocksource/exynos_mct: irq_pipeline: enable
+ pipelined clock events
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/clocksource/exynos_mct.c | 16 +++++++++-------
+ 1 file changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/clocksource/exynos_mct.c b/drivers/clocksource/exynos_mct.c
+index ec5909226..1eafb3d40 100644
+--- a/drivers/clocksource/exynos_mct.c
++++ b/drivers/clocksource/exynos_mct.c
+@@ -312,7 +312,8 @@ static int mct_set_state_periodic(struct clock_event_device *evt)
+ static struct clock_event_device mct_comp_device = {
+ 	.name			= "mct-comp",
+ 	.features		= CLOCK_EVT_FEAT_PERIODIC |
+-				  CLOCK_EVT_FEAT_ONESHOT,
++				  CLOCK_EVT_FEAT_ONESHOT |
++				  CLOCK_EVT_FEAT_PIPELINE,
+ 	.rating			= 250,
+ 	.set_next_event		= exynos4_comp_set_next_event,
+ 	.set_state_periodic	= mct_set_state_periodic,
+@@ -328,7 +329,7 @@ static irqreturn_t exynos4_mct_comp_isr(int irq, void *dev_id)
+ 
+ 	exynos4_mct_write(0x1, EXYNOS4_MCT_G_INT_CSTAT);
+ 
+-	evt->event_handler(evt);
++	clockevents_handle_event(evt);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -438,7 +439,7 @@ static irqreturn_t exynos4_mct_tick_isr(int irq, void *dev_id)
+ 
+ 	exynos4_mct_tick_clear(mevt);
+ 
+-	evt->event_handler(evt);
++	clockevents_handle_event(evt);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -460,7 +461,8 @@ static int exynos4_mct_starting_cpu(unsigned int cpu)
+ 	evt->set_state_oneshot = set_state_shutdown;
+ 	evt->set_state_oneshot_stopped = set_state_shutdown;
+ 	evt->tick_resume = set_state_shutdown;
+-	evt->features = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT;
++	evt->features = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT | \
++		CLOCK_EVT_FEAT_PIPELINE;
+ 	evt->rating = 500;	/* use value higher than ARM arch timer */
+ 
+ 	exynos4_mct_write(TICK_BASE_CNT, mevt->base + MCT_L_TCNTB_OFFSET);
+@@ -545,9 +547,9 @@ static int __init exynos4_timer_interrupts(struct device_node *np,
+ 
+ 	if (mct_int_type == MCT_INT_PPI) {
+ 
+-		err = request_percpu_irq(mct_irqs[MCT_L0_IRQ],
+-					 exynos4_mct_tick_isr, "MCT",
+-					 &percpu_mct_tick);
++		err = __request_percpu_irq(mct_irqs[MCT_L0_IRQ],
++					exynos4_mct_tick_isr, IRQF_TIMER,
++					"MCT", &percpu_mct_tick);
+ 		WARN(err, "MCT: can't request IRQ %d (%d)\n",
+ 		     mct_irqs[MCT_L0_IRQ], err);
+ 	} else {
+-- 
+2.38.1
+

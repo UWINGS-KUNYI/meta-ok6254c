@@ -1,0 +1,49 @@
+From 5d52e1df1881d45944aad6a65e1a55a087e8cd7d Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 16 Jun 2020 11:04:16 +0200
+Subject: [PATCH 022/179] rcu: irq_pipeline: exclude out-of-band context from
+ EQS
+
+In a pipelined interrupt model, a CPU which is running code on the
+out-of-band stage or with hard interrupts disabled cannot be in a
+quiescent state by definition. Have RCU assume this when checking for
+EQS.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ include/linux/rcupdate.h | 2 +-
+ kernel/rcu/update.c      | 5 +++++
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/rcupdate.h b/include/linux/rcupdate.h
+index 095b3b39b..62085617c 100644
+--- a/include/linux/rcupdate.h
++++ b/include/linux/rcupdate.h
+@@ -290,7 +290,7 @@ static inline int rcu_read_lock_bh_held(void)
+ 
+ static inline int rcu_read_lock_sched_held(void)
+ {
+-	return !preemptible();
++	return !running_inband() || !preemptible();
+ }
+ 
+ static inline int rcu_read_lock_any_held(void)
+diff --git a/kernel/rcu/update.c b/kernel/rcu/update.c
+index 849f0aa99..233c25ceb 100644
+--- a/kernel/rcu/update.c
++++ b/kernel/rcu/update.c
+@@ -99,6 +99,11 @@ module_param(rcu_normal_after_boot, int, 0);
+  */
+ static bool rcu_read_lock_held_common(bool *ret)
+ {
++	if (irqs_pipelined() &&
++		(hard_irqs_disabled() || running_oob())) {
++		*ret = 1;
++		return true;
++	}
+ 	if (!debug_lockdep_rcu_enabled()) {
+ 		*ret = true;
+ 		return true;
+-- 
+2.38.1
+

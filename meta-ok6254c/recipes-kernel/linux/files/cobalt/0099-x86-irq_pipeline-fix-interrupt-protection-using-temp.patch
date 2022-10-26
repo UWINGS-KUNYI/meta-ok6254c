@@ -1,0 +1,56 @@
+From 16df93209f7b2280b4c25aa994940f8d87dfa4a5 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Mon, 15 Mar 2021 13:20:06 +0100
+Subject: [PATCH 099/179] x86: irq_pipeline: fix interrupt protection using
+ temporary mm - take #2
+
+This change partially reverts commit #b8ccedcc, which wrongly
+re-enables hard irqs before the TLB is flushed. The entire section
+reinstating the temporary mm must run with hard irqs off, which is
+already enforced by local_irq_{save, restore}_full().
+
+Drop the broken hard irq toggles from {use, unuse}_temporary_mm(), but
+leave the assertion checking for the correct hard interrupt state on
+entry of the former.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/x86/kernel/alternative.c | 8 +-------
+ 1 file changed, 1 insertion(+), 7 deletions(-)
+
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index f833ff856..a1e7ba5e0 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -1113,6 +1113,7 @@ static inline temp_mm_state_t use_temporary_mm(struct mm_struct *mm)
+ 	temp_mm_state_t temp_state;
+ 
+ 	lockdep_assert_irqs_disabled();
++	WARN_ON_ONCE(irq_pipeline_debug() && !hard_irqs_disabled());
+ 
+ 	/*
+ 	 * Make sure not to be in TLB lazy mode, as otherwise we'll end up
+@@ -1122,12 +1123,6 @@ static inline temp_mm_state_t use_temporary_mm(struct mm_struct *mm)
+ 	if (this_cpu_read(cpu_tlbstate.is_lazy))
+ 		leave_mm(smp_processor_id());
+ 
+-	/*
+-	 * unuse_temporary_mm() assumes hardirqs were off on entry to
+-	 * use_temporary_mm(), assert this condition.
+-	 */
+-	WARN_ON_ONCE(irq_pipeline_debug() && hard_irqs_disabled());
+-	hard_cond_local_irq_disable();
+ 	temp_state.mm = this_cpu_read(cpu_tlbstate.loaded_mm);
+ 	switch_mm_irqs_off(NULL, mm, current);
+ 
+@@ -1152,7 +1147,6 @@ static inline void unuse_temporary_mm(temp_mm_state_t prev_state)
+ {
+ 	lockdep_assert_irqs_disabled();
+ 	switch_mm_irqs_off(NULL, prev_state.mm, current);
+-	hard_cond_local_irq_enable();
+ 
+ 	/*
+ 	 * Restore the breakpoints if they were disabled before the temporary mm
+-- 
+2.38.1
+

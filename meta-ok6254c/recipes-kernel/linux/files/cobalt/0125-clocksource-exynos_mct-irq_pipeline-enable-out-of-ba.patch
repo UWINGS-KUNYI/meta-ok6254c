@@ -1,0 +1,30 @@
+From 97e15775fe73c9d59a4b5478ce0ef80e92eeb0bf Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 22 Jul 2021 10:05:28 +0200
+Subject: [PATCH 125/179] clocksource/exynos_mct: irq_pipeline: enable
+ out-of-band clock events
+
+Ensure end-of-end out-of-band event delivery by receiving the clock
+interrupts directly on the out-of-band stage.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/clocksource/exynos_mct.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/clocksource/exynos_mct.c b/drivers/clocksource/exynos_mct.c
+index 1eafb3d40..243adda8c 100644
+--- a/drivers/clocksource/exynos_mct.c
++++ b/drivers/clocksource/exynos_mct.c
+@@ -340,7 +340,7 @@ static int exynos4_clockevent_init(void)
+ 	clockevents_config_and_register(&mct_comp_device, clk_rate,
+ 					0xf, 0xffffffff);
+ 	if (request_irq(mct_irqs[MCT_G0_IRQ], exynos4_mct_comp_isr,
+-			IRQF_TIMER | IRQF_IRQPOLL, "mct_comp_irq",
++			IRQF_TIMER | IRQF_IRQPOLL | IRQF_OOB, "mct_comp_irq",
+ 			&mct_comp_device))
+ 		pr_err("%s: request_irq() failed\n", "mct_comp_irq");
+ 
+-- 
+2.38.1
+

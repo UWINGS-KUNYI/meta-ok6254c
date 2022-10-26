@@ -1,0 +1,47 @@
+From 601d454355dc543fd35fdbdc4d1c286621598741 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Wed, 9 Jun 2021 18:24:25 +0200
+Subject: [PATCH 111/179] irq_pipeline: genirq: Mark inband stalled also on
+ exceptions
+
+Make sure that inband is marked stalled when entering from user mode,
+taking an exception.
+
+This affects x86 which is currently the only arch using generic
+irqentry_enter_from_user_mode on exceptions. It fixes this lockdep
+warning:
+
+DEBUG_LOCKS_WARN_ON(!lockdep_stage_disabled())
+WARNING: CPU: 2 PID: 1477 at ../kernel/locking/lockdep.c:4129 lockdep_hardirqs_on_prepare+0x160/0x1a0
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+Tested-by: Jan Kiszka <jan.kiszka@siemens.com>
+---
+ kernel/entry/common.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/entry/common.c b/kernel/entry/common.c
+index 4e81c0c03..b52f4ac50 100644
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -343,6 +343,8 @@ __visible noinstr void syscall_exit_to_user_mode(struct pt_regs *regs)
+ 
+ noinstr void irqentry_enter_from_user_mode(struct pt_regs *regs)
+ {
++	WARN_ON_ONCE(irq_pipeline_debug() && irqs_disabled());
++	stall_inband_nocheck();
+ 	enter_from_user_mode(regs);
+ }
+ 
+@@ -373,8 +375,6 @@ noinstr irqentry_state_t irqentry_enter(struct pt_regs *regs)
+ 
+ 	if (user_mode(regs)) {
+ #ifdef CONFIG_IRQ_PIPELINE
+-		WARN_ON_ONCE(irq_pipeline_debug() && irqs_disabled());
+-		stall_inband_nocheck();
+ 		ret.stage_info = IRQENTRY_INBAND_UNSTALLED;
+ #endif
+ 		irqentry_enter_from_user_mode(regs);
+-- 
+2.38.1
+

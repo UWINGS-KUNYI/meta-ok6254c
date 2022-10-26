@@ -1,0 +1,26 @@
+From 3b36a40726c02769a01dcd0a973c7e2f9610cc3b Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 4 Aug 2022 18:28:51 +0200
+Subject: [PATCH 172/179] gpio: zynq: irq_pipeline: advertise immediate
+ readiness
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/gpio/gpio-pca953x.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/gpio/gpio-pca953x.c b/drivers/gpio/gpio-pca953x.c
+index 957be5f69..09bb3fa1f 100644
+--- a/drivers/gpio/gpio-pca953x.c
++++ b/drivers/gpio/gpio-pca953x.c
+@@ -855,6 +855,7 @@ static int pca953x_irq_setup(struct pca953x_chip *chip, int irq_base)
+ 	irq_chip->irq_bus_sync_unlock = pca953x_irq_bus_sync_unlock;
+ 	irq_chip->irq_set_type = pca953x_irq_set_type;
+ 	irq_chip->irq_shutdown = pca953x_irq_shutdown;
++	irq_chip->flags |= IRQCHIP_PIPELINE_SAFE;
+ 
+ 	girq = &chip->gpio_chip.irq;
+ 	girq->chip = irq_chip;
+-- 
+2.38.1
+

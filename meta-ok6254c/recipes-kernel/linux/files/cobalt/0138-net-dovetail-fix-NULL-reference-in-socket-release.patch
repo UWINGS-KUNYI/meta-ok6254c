@@ -1,0 +1,30 @@
+From 5b8f70043b52e7261d6fd618cce2f712ca05108d Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Mon, 30 Aug 2021 19:57:02 +0200
+Subject: [PATCH 138/179] net: dovetail: fix NULL reference in socket release
+
+sock_oob_capable() might be called for a socket for which no
+protocol-agnostic area is allocated yet. Be careful when dereferencing
+this field.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ net/socket.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/socket.c b/net/socket.c
+index 7b1c036bb..23c972c3c 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -145,7 +145,7 @@ static void sock_show_fdinfo(struct seq_file *m, struct file *f)
+ 
+ static inline bool sock_oob_capable(struct socket *sock)
+ {
+-	return !!sock->sk->oob_data;
++	return sock->sk && sock->sk->oob_data;
+ }
+ 
+ int __weak sock_oob_attach(struct socket *sock)
+-- 
+2.38.1
+

@@ -1,0 +1,47 @@
+From 6f6545e4df4339b2baf0e4222bb8c2ad3ba22a55 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 9 Nov 2021 10:22:22 +0100
+Subject: [PATCH 150/179] ARM: dovetail: do not pass in-band prctl to the oob
+ handler
+
+Receiving in-band __NR_prctl syscalls via their oob handler may
+confuse some companion cores still using the legacy call form (i.e. nr
+| __OOB_SYSCALL_BIT).
+
+Dig a little deeper into prctl() call args in order to pass oob call
+forms exclusively to handle_oob_syscall().
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm/kernel/entry-common.S | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/kernel/entry-common.S b/arch/arm/kernel/entry-common.S
+index 7f187e634..525500060 100644
+--- a/arch/arm/kernel/entry-common.S
++++ b/arch/arm/kernel/entry-common.S
+@@ -285,7 +285,7 @@ ENTRY(vector_swi)
+ 
+ local_restart:
+ #ifdef CONFIG_DOVETAIL
+-	ldr	r10, [tsk, #TI_LOCAL_FLAGS]	@ tsk(r9) is callee-saved
++	ldr	r10, [tsk, #TI_LOCAL_FLAGS]	@ tsk(r10) is callee-saved
+ #ifdef CONFIG_IPIPE_COMPAT
+ 	ldr	r0, =#0xf0042			@ old syscall signature
+ 	cmp	scno, r0
+@@ -295,7 +295,11 @@ local_restart:
+ 1:
+ #endif	
+ 	cmp	scno, #__NR_prctl
+-	beq	fastcall_try
++	bne	fastcall_not_prctl
++	ldr	r0, [sp, #S_OLD_R0]
++	tst	r10, #__OOB_SYSCALL_BIT
++	bne	fastcall_try
++fastcall_not_prctl:
+ 	ldr	r0, =#__OOB_SYSCALL_BIT
+ 	ands	r0, scno, r0
+ 	beq	slow_path
+-- 
+2.38.1
+

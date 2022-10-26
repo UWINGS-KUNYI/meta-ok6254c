@@ -1,0 +1,29 @@
+From b7e1d163455528124f9a9e4181b98360eb9fc00b Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 9 Nov 2021 11:01:34 +0100
+Subject: [PATCH 147/179] x86: dovetail: add syscall_get_arg0() helper
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/x86/include/asm/syscall.h | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/arch/x86/include/asm/syscall.h b/arch/x86/include/asm/syscall.h
+index 7cbf733d1..7b2a4648f 100644
+--- a/arch/x86/include/asm/syscall.h
++++ b/arch/x86/include/asm/syscall.h
+@@ -128,6 +128,11 @@ static inline void syscall_get_arguments(struct task_struct *task,
+ 	}
+ }
+ 
++static inline unsigned long syscall_get_arg0(struct pt_regs *regs)
++{
++	return regs->di;
++}
++
+ static inline void syscall_set_arguments(struct task_struct *task,
+ 					 struct pt_regs *regs,
+ 					 const unsigned long *args)
+-- 
+2.38.1
+

@@ -1,0 +1,67 @@
+From bbb1f977e6d23b77426596d8b37560a8b33fe68b Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 24 Jan 2021 11:31:32 +0100
+Subject: [PATCH 088/179] x86/mm: dovetail: fix interrupt state synchronization
+ upon fault
+
+When the fault handling code wants to re-enable IRQs, we need to
+carefully fixup the in-band stall bit (if applicable) and the hardware
+flag appropriately, which means:
+
+- enabling back IRQs over the kernel context should lead to unstalling
+  the in-band stage if only we did have to stall it upon taking the
+  fault.
+
+- flip the in-band stall bit manually instead of calling
+  local_irq_enable(), so that we may do this with hardware IRQs
+  disabled without triggering the debug check.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/x86/mm/fault.c | 19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 5d4ba7b64..282772a60 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -803,26 +803,27 @@ static bool is_vsyscall_vaddr(unsigned long vaddr)
+ static inline void cond_reenable_irqs_user(void)
+ {
+ 	if (running_inband())
+-		local_irq_enable_full();
+-	else
+-		hard_local_irq_enable();
++		unstall_inband_nocheck();
++
++	hard_local_irq_enable();
+ }
+ 
+ static inline void cond_reenable_irqs_kernel(irqentry_state_t state,
+ 					struct pt_regs *regs)
+ {
+-	if (regs->flags & X86_EFLAGS_IF)
++	if (regs->flags & X86_EFLAGS_IF) {
++		if (state.stage_info & IRQENTRY_INBAND_STALLED)
++			unstall_inband_nocheck();
+ 		hard_local_irq_enable();
+-	if (state.stage_info & IRQENTRY_INBAND_STALLED)
+-		local_irq_enable();
++	}
+ }
+ 
+ static inline void cond_disable_irqs(void)
+ {
++	hard_local_irq_disable();
++
+ 	if (running_inband())
+-		local_irq_disable_full();
+-	else
+-		hard_local_irq_disable();
++		stall_inband_nocheck();
+ }
+ 
+ #else  /* !CONFIG_DOVETAIL */
+-- 
+2.38.1
+

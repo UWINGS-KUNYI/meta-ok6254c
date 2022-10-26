@@ -1,0 +1,27 @@
+From 2fdaa2a683fa1fd4bcd772f4ad9c19b817b1db1b Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 9 Nov 2021 10:12:27 +0100
+Subject: [PATCH 145/179] arm64: irq_pipeline: resync interrupt state on bp
+ handling
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm64/kernel/debug-monitors.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/kernel/debug-monitors.c b/arch/arm64/kernel/debug-monitors.c
+index fa76151de..f16499f8e 100644
+--- a/arch/arm64/kernel/debug-monitors.c
++++ b/arch/arm64/kernel/debug-monitors.c
+@@ -232,7 +232,7 @@ static void send_user_sigtrap(int si_code)
+ 		return;
+ 
+ 	if (interrupts_enabled(regs))
+-		local_irq_enable();
++		local_irq_enable_full();
+ 
+ 	arm64_force_sig_fault(SIGTRAP, si_code,
+ 			     (void __user *)instruction_pointer(regs),
+-- 
+2.38.1
+

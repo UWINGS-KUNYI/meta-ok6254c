@@ -1,0 +1,72 @@
+From bbb6e69c6f72b69465ccf3cc777a05a5e2ca4fe5 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Wed, 27 Jul 2016 21:27:59 +0200
+Subject: [PATCH 024/179] printk: irq_pipeline: safe printk with IRQ pipelining
+
+Defer printk output not to wreck the hard interrupt state, cause
+unacceptable latency, or risk a deadlock, if either printk() is called
+from the oob stage or IRQs are hard disabled on entry (which covers
+the case of running over the root stage holding a hard lock).
+
+Deferral is obtained by following the NMI path in vprintk_func() when
+any of the above conditions is true. This relies on the ability for
+the oob stage to submit work requests to the in-band stage using the
+irq_work_queue() interface.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ init/Kconfig                | 2 +-
+ kernel/printk/printk.c      | 2 +-
+ kernel/printk/printk_safe.c | 3 +++
+ 3 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/init/Kconfig b/init/Kconfig
+index 06d6e173b..1096ee8fb 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1491,7 +1491,7 @@ config PRINTK
+ config PRINTK_NMI
+ 	def_bool y
+ 	depends on PRINTK
+-	depends on HAVE_NMI
++	depends on HAVE_NMI || IRQ_PIPELINE
+ 
+ config RAW_PRINTK
+        bool "Enable support for raw printk"
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index 9ee11513b..7d6588a17 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -2164,7 +2164,7 @@ asmlinkage __visible void early_printk(const char *fmt, ...)
+ 
+ #ifdef CONFIG_RAW_PRINTK
+ static struct console *raw_console;
+-static DEFINE_RAW_SPINLOCK(raw_console_lock);
++static DEFINE_HARD_SPINLOCK(raw_console_lock);
+ 
+ void raw_puts(const char *s, size_t len)
+ {
+diff --git a/kernel/printk/printk_safe.c b/kernel/printk/printk_safe.c
+index 2e9e3ed7d..9c065e42d 100644
+--- a/kernel/printk/printk_safe.c
++++ b/kernel/printk/printk_safe.c
+@@ -9,6 +9,7 @@
+ #include <linux/kdb.h>
+ #include <linux/smp.h>
+ #include <linux/cpumask.h>
++#include <linux/irq_pipeline.h>
+ #include <linux/irq_work.h>
+ #include <linux/printk.h>
+ #include <linux/kprobes.h>
+@@ -374,6 +375,8 @@ __printf(1, 0) int vprintk_func(const char *fmt, va_list args)
+ 	if (unlikely(kdb_trap_printk && kdb_printf_cpu < 0))
+ 		return vkdb_printf(KDB_MSGSRC_PRINTK, fmt, args);
+ #endif
++	if (inband_unsafe())
++		return vprintk_nmi(fmt, args);
+ 
+ 	/*
+ 	 * Try to use the main logbuf even in NMI. But avoid calling console
+-- 
+2.38.1
+

@@ -1,0 +1,31 @@
+From 84f797456861604bf6eba76c9cc22d1cc59bad91 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 22 Jul 2021 09:36:12 +0200
+Subject: [PATCH 122/179] drm/msm/mdp5: irq_pipeline: enable out-of-band
+ interrupt handling
+
+We must decode the chained interrupts on the out-of-band stage to
+enable end-to-end out-of-band delivery. Set IRQF_OOB for the parent
+handler.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_mdss.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/mdp5/mdp5_mdss.c b/drivers/gpu/drm/msm/disp/mdp5/mdp5_mdss.c
+index 8e0f2be15..781d701df 100644
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_mdss.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_mdss.c
+@@ -255,7 +255,7 @@ int mdp5_mdss_init(struct drm_device *dev)
+ 	}
+ 
+ 	ret = devm_request_irq(dev->dev, platform_get_irq(pdev, 0),
+-			       mdss_irq, 0, "mdss_isr", mdp5_mdss);
++			       mdss_irq, IRQF_OOB, "mdss_isr", mdp5_mdss);
+ 	if (ret) {
+ 		DRM_DEV_ERROR(dev->dev, "failed to init irq: %d\n", ret);
+ 		goto fail_irq;
+-- 
+2.38.1
+

@@ -1,0 +1,26 @@
+From 9378a42c18dcb1f1276666cc89ff10bdf01ec7c3 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Fri, 12 Aug 2022 18:56:56 +0200
+Subject: [PATCH 174/179] soc: ti: ti_sci_inta_msi: irq_pipeline: advertise
+ immediate readiness
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ drivers/soc/ti/ti_sci_inta_msi.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/soc/ti/ti_sci_inta_msi.c b/drivers/soc/ti/ti_sci_inta_msi.c
+index 0eb9462f6..21d222b90 100644
+--- a/drivers/soc/ti/ti_sci_inta_msi.c
++++ b/drivers/soc/ti/ti_sci_inta_msi.c
+@@ -42,6 +42,7 @@ static void ti_sci_inta_msi_update_chip_ops(struct msi_domain_info *info)
+ 	chip->irq_unmask = irq_chip_unmask_parent;
+ 	chip->irq_mask = irq_chip_mask_parent;
+ 	chip->irq_ack = irq_chip_ack_parent;
++	chip->flags |= IRQCHIP_PIPELINE_SAFE;
+ }
+ 
+ struct irq_domain *ti_sci_inta_msi_create_irq_domain(struct fwnode_handle *fwnode,
+-- 
+2.38.1
+

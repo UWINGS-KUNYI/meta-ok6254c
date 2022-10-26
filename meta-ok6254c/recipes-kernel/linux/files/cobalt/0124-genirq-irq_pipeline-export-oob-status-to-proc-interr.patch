@@ -1,0 +1,28 @@
+From 49138d5b7c2da1ca7563b8aefaf67767667f2698 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 22 Jul 2021 10:02:01 +0200
+Subject: [PATCH 124/179] genirq: irq_pipeline: export oob status to
+ /proc/interrupts
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ kernel/irq/proc.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/kernel/irq/proc.c b/kernel/irq/proc.c
+index 72513ed2a..210c5009d 100644
+--- a/kernel/irq/proc.c
++++ b/kernel/irq/proc.c
+@@ -517,6 +517,9 @@ int show_interrupts(struct seq_file *p, void *v)
+ 		seq_printf(p, " %*s", prec, "");
+ #ifdef CONFIG_GENERIC_IRQ_SHOW_LEVEL
+ 	seq_printf(p, " %-8s", irqd_is_level_type(&desc->irq_data) ? "Level" : "Edge");
++#endif
++#ifdef CONFIG_IRQ_PIPELINE
++	seq_printf(p, " %-3s", irq_settings_is_oob(desc) ? "oob" : "");
+ #endif
+ 	if (desc->name)
+ 		seq_printf(p, "-%-8s", desc->name);
+-- 
+2.38.1
+

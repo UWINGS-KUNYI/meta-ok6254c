@@ -1,0 +1,428 @@
+From cb130f9607e30ab433c68fa7fbe660bb41c15f8f Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 12 May 2020 18:08:35 +0200
+Subject: [PATCH 059/179] ARM: dovetail: route traps
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/arm/include/asm/dovetail.h         | 11 +++++
+ arch/arm/include/asm/thread_info.h      |  1 +
+ arch/arm/include/asm/trace/exceptions.h | 62 ++++++++++++++++++++++++
+ arch/arm/kernel/entry-armv.S            | 20 ++++++++
+ arch/arm/kernel/ptrace.c                |  2 +
+ arch/arm/mm/alignment.c                 | 17 +++++--
+ arch/arm/mm/fault.c                     | 64 +++++++++++++++++--------
+ 7 files changed, 151 insertions(+), 26 deletions(-)
+ create mode 100644 arch/arm/include/asm/trace/exceptions.h
+
+diff --git a/arch/arm/include/asm/dovetail.h b/arch/arm/include/asm/dovetail.h
+index 86e81cce9..84abff122 100644
+--- a/arch/arm/include/asm/dovetail.h
++++ b/arch/arm/include/asm/dovetail.h
+@@ -6,4 +6,15 @@
+ #ifndef _ASM_ARM_DOVETAIL_H
+ #define _ASM_ARM_DOVETAIL_H
+ 
++/* ARM traps */
++#define ARM_TRAP_ACCESS		0	/* Data or instruction access exception */
++#define ARM_TRAP_SECTION	1	/* Section fault */
++#define ARM_TRAP_DABT		2	/* Generic data abort */
++#define ARM_TRAP_PABT		3	/* Prefetch abort */
++#define ARM_TRAP_BREAK		4	/* Instruction breakpoint */
++#define ARM_TRAP_FPU		5	/* Floating point exception */
++#define ARM_TRAP_VFP		6	/* VFP floating point exception */
++#define ARM_TRAP_UNDEFINSTR	7	/* Undefined instruction */
++#define ARM_TRAP_ALIGNMENT	8	/* Unaligned access exception */
++
+ #endif /* _ASM_ARM_DOVETAIL_H */
+diff --git a/arch/arm/include/asm/thread_info.h b/arch/arm/include/asm/thread_info.h
+index 8c5377303..86e7bdd2a 100644
+--- a/arch/arm/include/asm/thread_info.h
++++ b/arch/arm/include/asm/thread_info.h
+@@ -174,6 +174,7 @@ extern int vfp_restore_user_hwstate(struct user_vfp *,
+ #define _TLF_OOB		0x0001
+ #define _TLF_DOVETAIL		0x0002
+ #define _TLF_OFFSTAGE		0x0004
++#define _TLF_OOBTRAP		0x0008
+ 
+ #endif /* __KERNEL__ */
+ #endif /* __ASM_ARM_THREAD_INFO_H */
+diff --git a/arch/arm/include/asm/trace/exceptions.h b/arch/arm/include/asm/trace/exceptions.h
+new file mode 100644
+index 000000000..bdb666b3d
+--- /dev/null
++++ b/arch/arm/include/asm/trace/exceptions.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM exceptions
++
++#if !defined(_TRACE_EXCEPTIONS_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_EXCEPTIONS_H
++
++#include <linux/tracepoint.h>
++#include <asm/ptrace.h>
++#include <asm/dovetail.h>
++
++#define __trace_trap(__sym)	{ __sym, #__sym }
++
++#define trace_trap_symbolic(__trapnr)				\
++	__print_symbolic(__trapnr,				\
++			__trace_trap(ARM_TRAP_ACCESS),		\
++			__trace_trap(ARM_TRAP_SECTION),		\
++			__trace_trap(ARM_TRAP_DABT),		\
++			__trace_trap(ARM_TRAP_PABT),		\
++			__trace_trap(ARM_TRAP_BREAK),		\
++			__trace_trap(ARM_TRAP_FPU),		\
++			__trace_trap(ARM_TRAP_VFP),		\
++			__trace_trap(ARM_TRAP_UNDEFINSTR),	\
++			__trace_trap(ARM_TRAP_ALIGNMENT))
++
++DECLARE_EVENT_CLASS(ARM_trap_event,
++	TP_PROTO(int trapnr, struct pt_regs *regs),
++	TP_ARGS(trapnr, regs),
++
++	TP_STRUCT__entry(
++		__field(int, trapnr)
++		__field(struct pt_regs *, regs)
++		),
++
++	TP_fast_assign(
++		__entry->trapnr = trapnr;
++		__entry->regs = regs;
++		),
++
++	TP_printk("%s mode trap: %s",
++		user_mode(__entry->regs) ? "user" : "kernel",
++		trace_trap_symbolic(__entry->trapnr))
++);
++
++DEFINE_EVENT(ARM_trap_event, ARM_trap_entry,
++	TP_PROTO(int trapnr, struct pt_regs *regs),
++	TP_ARGS(trapnr, regs)
++);
++
++DEFINE_EVENT(ARM_trap_event, ARM_trap_exit,
++	TP_PROTO(int trapnr, struct pt_regs *regs),
++	TP_ARGS(trapnr, regs)
++);
++
++#undef TRACE_INCLUDE_PATH
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_PATH asm/trace
++#define TRACE_INCLUDE_FILE exceptions
++#endif /*  _TRACE_EXCEPTIONS_H */
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+diff --git a/arch/arm/kernel/entry-armv.S b/arch/arm/kernel/entry-armv.S
+index a78a3c252..225ea6a73 100644
+--- a/arch/arm/kernel/entry-armv.S
++++ b/arch/arm/kernel/entry-armv.S
+@@ -33,6 +33,7 @@
+ #include "entry-header.S"
+ #include <asm/entry-macro-multi.S>
+ #include <asm/probes.h>
++#include <asm/dovetail.h>
+ 
+ /*
+  * Interrupt handling.
+@@ -264,6 +265,16 @@ __und_svc:
+ 	svc_entry MAX_STACK_SIZE
+ #else
+ 	svc_entry
++#endif
++#ifdef CONFIG_DOVETAIL
++	get_thread_info tsk
++	ldr	r0, [tsk, #TI_PREEMPT]		@ get preempt count
++	tst	r0, #TI_OOB_MASK		@ oob stage?
++	beq	1f
++	mov	r0, #ARM_TRAP_UNDEFINSTR
++	mov	r1, sp				@ r1 = &regs
++	bl	__oob_trap_notify
++1:
+ #endif
+ 
+ 	mov	r1, #4				@ PC correction to apply
+@@ -274,6 +285,15 @@ __und_svc:
+ 
+ __und_svc_finish:
+ 	get_thread_info tsk
++#ifdef CONFIG_DOVETAIL
++	ldr	r0, [tsk, #TI_PREEMPT]		@ get preempt count
++	tst	r0, #TI_OOB_MASK		@ oob stage?
++	beq	1f
++	mov	r0, #ARM_TRAP_UNDEFINSTR
++	mov	r1, sp				@ r1 = &regs
++	bl	__oob_trap_unwind
++1:
++#endif
+ 	ldr	r5, [sp, #S_PSR]		@ Get SVC cpsr
+ 	svc_exit r5				@ return from exception
+  UNWIND(.fnend		)
+diff --git a/arch/arm/kernel/ptrace.c b/arch/arm/kernel/ptrace.c
+index 2771e6822..77604582e 100644
+--- a/arch/arm/kernel/ptrace.c
++++ b/arch/arm/kernel/ptrace.c
+@@ -205,7 +205,9 @@ void ptrace_break(struct pt_regs *regs)
+ 
+ static int break_trap(struct pt_regs *regs, unsigned int instr)
+ {
++	oob_trap_notify(ARM_TRAP_BREAK, regs);
+ 	ptrace_break(regs);
++	oob_trap_unwind(ARM_TRAP_BREAK, regs);
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm/mm/alignment.c b/arch/arm/mm/alignment.c
+index df77bdd06..5f2501d33 100644
+--- a/arch/arm/mm/alignment.c
++++ b/arch/arm/mm/alignment.c
+@@ -19,6 +19,7 @@
+ #include <linux/init.h>
+ #include <linux/sched/signal.h>
+ #include <linux/uaccess.h>
++#include <linux/dovetail.h>
+ 
+ #include <asm/cp15.h>
+ #include <asm/system_info.h>
+@@ -807,11 +808,13 @@ do_alignment(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 	u16 tinstr = 0;
+ 	int isize = 4;
+ 	int thumb2_32b = 0;
+-	int fault;
++	int fault, ret = 0;
+ 
+ 	if (interrupts_enabled(regs))
+ 		hard_local_irq_enable();
+ 
++	oob_trap_notify(ARM_TRAP_ALIGNMENT, regs);
++
+ 	instrptr = instruction_pointer(regs);
+ 
+ 	if (thumb_mode(regs)) {
+@@ -938,7 +941,7 @@ do_alignment(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 	if (thumb_mode(regs))
+ 		regs->ARM_cpsr = it_advance(regs->ARM_cpsr);
+ 
+-	return 0;
++	goto out;
+ 
+  bad_or_fault:
+ 	if (type == TYPE_ERROR)
+@@ -947,7 +950,7 @@ do_alignment(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 	 * We got a fault - fix it up, or die.
+ 	 */
+ 	do_bad_area(addr, fsr, regs);
+-	return 0;
++	goto out;
+ 
+  swp:
+ 	pr_err("Alignment trap: not handling swp instruction\n");
+@@ -961,7 +964,8 @@ do_alignment(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 		isize << 1,
+ 		isize == 2 ? tinstr : instr, instrptr);
+ 	ai_skipped += 1;
+-	return 1;
++	ret = 1;
++	goto out;
+ 
+  user:
+ 	ai_user += 1;
+@@ -997,7 +1001,10 @@ do_alignment(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 			set_cr(cr_no_alignment);
+ 	}
+ 
+-	return 0;
++out:
++	oob_trap_unwind(ARM_TRAP_ALIGNMENT, regs);
++
++	return ret;
+ }
+ 
+ static int __init noalign_setup(char *__unused)
+diff --git a/arch/arm/mm/fault.c b/arch/arm/mm/fault.c
+index d4dcd8639..064eac261 100644
+--- a/arch/arm/mm/fault.c
++++ b/arch/arm/mm/fault.c
+@@ -22,6 +22,9 @@
+ #include <asm/system_misc.h>
+ #include <asm/system_info.h>
+ #include <asm/tlbflush.h>
++#include <asm/dovetail.h>
++#define CREATE_TRACE_POINTS
++#include <asm/trace/exceptions.h>
+ 
+ #include "fault.h"
+ 
+@@ -40,12 +43,22 @@
+  * helpers. From the main kernel's point of view, there is no change.
+  */
+ static inline
+-unsigned long fault_entry(struct pt_regs *regs)
++unsigned long fault_entry(int exception, struct pt_regs *regs)
+ {
+ 	unsigned long flags;
+ 	int nosync = 1;
+ 
++	trace_ARM_trap_entry(exception, regs);
++
++	/*
++	 * CAUTION: The co-kernel might demote the current context to
++	 * the in-band stage as a result of handling this trap,
++	 * returning with hard irqs on.
++	 */
++	oob_trap_notify(exception, regs);
++
+ 	flags = hard_local_irq_save();
++
+ 	if (hard_irqs_disabled_flags(flags))
+ 		nosync = test_and_stall_inband();
+ 
+@@ -54,13 +67,17 @@ unsigned long fault_entry(struct pt_regs *regs)
+ 	return irqs_merge_flags(flags, nosync);
+ }
+ 
+-static inline void fault_exit(unsigned long combo)
++static inline
++void fault_exit(int exception, struct pt_regs *regs,
++		unsigned long combo)
+ {
+ 	unsigned long flags;
+ 	int nosync;
+ 
+ 	WARN_ON_ONCE(irq_pipeline_debug() && hard_irqs_disabled());
+ 
++	oob_trap_unwind(exception, regs);
++
+ 	/*
+ 	 * '!nosync' here means that we had to turn on the stall bit
+ 	 * in fault_entry() to mirror the hard interrupt state,
+@@ -81,17 +98,15 @@ static inline void fault_exit(unsigned long combo)
+ 			hard_local_irq_enable();
+ 	} else if (hard_irqs_disabled_flags(flags))
+ 		hard_local_irq_disable();
++
++	trace_ARM_trap_exit(exception, regs);
+ }
+ 
+ #else	/* !CONFIG_IRQ_PIPELINE */
+ 
+-static inline
+-unsigned long fault_entry(struct pt_regs *regs)
+-{
+-	return 0;
+-}
+-
+-static inline void fault_exit(unsigned long x) { }
++#define fault_entry(__exception, __regs)  ({ 0; })
++#define fault_exit(__exception, __regs, __flags)  \
++	do { (void)(__flags); } while (0)
+ 
+ #endif	/* !CONFIG_IRQ_PIPELINE */
+ 
+@@ -165,6 +180,15 @@ void show_pte(const char *lvl, struct mm_struct *mm, unsigned long addr)
+ 	pr_cont("\n");
+ }
+ #else					/* CONFIG_MMU */
++unsigned long fault_entry(int exception, struct pt_regs *regs)
++{
++	return 0;
++}
++
++static inline void fault_exit(int exception, struct pt_regs *regs,
++			unsigned long combo)
++{ }
++
+ void show_pte(const char *lvl, struct mm_struct *mm, unsigned long addr)
+ { }
+ #endif					/* CONFIG_MMU */
+@@ -245,9 +269,9 @@ void do_bad_area(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 	 * have no context to handle this fault with.
+ 	 */
+ 	  if (user_mode(regs)) {
+-		irqflags = fault_entry(regs);
++		irqflags = fault_entry(ARM_TRAP_ACCESS, regs);
+ 		__do_user_fault(addr, fsr, SIGSEGV, SEGV_MAPERR, regs);
+-		fault_exit(irqflags);
++		fault_exit(ARM_TRAP_ACCESS, regs, irqflags);
+ 	  } else
+ 		/*
+ 		 * irq_pipeline: kernel faults are either quickly
+@@ -324,7 +348,7 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 	unsigned int flags = FAULT_FLAG_DEFAULT;
+ 	unsigned long irqflags;
+ 
+-	irqflags = fault_entry(regs);
++	irqflags = fault_entry(ARM_TRAP_ACCESS, regs);
+ 
+ 	if (kprobe_page_fault(regs, fsr))
+ 		goto out;
+@@ -441,7 +465,7 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ no_context:
+ 	__do_kernel_fault(mm, addr, fsr, regs);
+ out:
+-	fault_exit(irqflags);
++	fault_exit(ARM_TRAP_ACCESS, regs, irqflags);
+ 
+ 	return 0;
+ }
+@@ -536,9 +560,7 @@ do_translation_fault(unsigned long addr, unsigned int fsr,
+ 	return 0;
+ 
+ bad_area:
+-	irqflags = fault_entry(regs);
+ 	do_bad_area(addr, fsr, regs);
+-	fault_exit(irqflags);
+ 	return 0;
+ }
+ #else					/* CONFIG_MMU */
+@@ -560,9 +582,9 @@ do_sect_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ {
+ 	unsigned long irqflags;
+ 
+-	irqflags = fault_entry(regs);
++	irqflags = fault_entry(ARM_TRAP_SECTION, regs);
+ 	do_bad_area(addr, fsr, regs);
+-	fault_exit(irqflags);
++	fault_exit(ARM_TRAP_SECTION, regs, irqflags);
+ 	return 0;
+ }
+ #endif /* CONFIG_ARM_LPAE */
+@@ -615,7 +637,7 @@ do_DataAbort(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 	if (!inf->fn(addr, fsr & ~FSR_LNX_PF, regs))
+ 		return;
+ 
+-	irqflags = fault_entry(regs);
++	irqflags = fault_entry(ARM_TRAP_DABT, regs);
+ 	pr_alert("8<--- cut here ---\n");
+ 	pr_alert("Unhandled fault: %s (0x%03x) at 0x%08lx\n",
+ 		inf->name, fsr, addr);
+@@ -623,7 +645,7 @@ do_DataAbort(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 
+ 	arm_notify_die("", regs, inf->sig, inf->code, (void __user *)addr,
+ 		       fsr, 0);
+-	fault_exit(irqflags);
++	fault_exit(ARM_TRAP_DABT, regs, irqflags);
+ }
+ 
+ void __init
+@@ -648,13 +670,13 @@ do_PrefetchAbort(unsigned long addr, unsigned int ifsr, struct pt_regs *regs)
+ 	if (!inf->fn(addr, ifsr | FSR_LNX_PF, regs))
+ 		return;
+ 
+-	irqflags = fault_entry(regs);
++	irqflags = fault_entry(ARM_TRAP_PABT, regs);
+ 	pr_alert("Unhandled prefetch abort: %s (0x%03x) at 0x%08lx\n",
+ 		inf->name, ifsr, addr);
+ 
+ 	arm_notify_die("", regs, inf->sig, inf->code, (void __user *)addr,
+ 		       ifsr, 0);
+-	fault_exit(irqflags);
++	fault_exit(ARM_TRAP_PABT, regs, irqflags);
+ }
+ 
+ /*
+-- 
+2.38.1
+

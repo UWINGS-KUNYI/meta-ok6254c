@@ -1,0 +1,26 @@
+From f7c4641eca32d6a9868c99c0007c805bb2feb578 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sat, 15 May 2021 12:18:19 +0200
+Subject: [PATCH 105/179] KVM: x86: irq_pipeline: pend L1D cache flush request
+ on any IRQ entry
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/x86/kernel/irq_pipeline.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/x86/kernel/irq_pipeline.c b/arch/x86/kernel/irq_pipeline.c
+index 0ea0e7b51..6b70dfd51 100644
+--- a/arch/x86/kernel/irq_pipeline.c
++++ b/arch/x86/kernel/irq_pipeline.c
+@@ -279,6 +279,7 @@ noinstr void arch_pipeline_entry(struct pt_regs *regs, u8 vector)
+ 		instrumentation_begin();
+ 		prevd = handle_irq_pipelined_prepare(regs);
+ 		arch_handle_irq(regs, vector, false);
++		kvm_set_cpu_l1tf_flush_l1d();
+ 		handle_irq_pipelined_finish(prevd, regs);
+ 		if (running_inband() && user_mode(regs)) {
+ 			stall_inband_nocheck();
+-- 
+2.38.1
+

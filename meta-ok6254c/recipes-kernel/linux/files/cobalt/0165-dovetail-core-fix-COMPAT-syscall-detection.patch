@@ -1,0 +1,49 @@
+From 4095fa7a34c20d27728ba3af4d3047365273003f Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 9 Jun 2022 09:41:42 +0200
+Subject: [PATCH 165/179] dovetail: core: fix COMPAT syscall detection
+
+A syscall number may be different for the same service in native or
+compat mode, e.g. aarch64 vs ARM32 for __NR_prctl. As a result, we
+cannot check for __NR_prctl verbatim in order to detect out-of-band
+syscalls.
+
+Delegate such detection to the architecture layer instead, which
+should check for the current task mode _and_ the syscall number for
+__NR_prctl from the appropriate native/compat set.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ include/linux/dovetail.h | 4 ++++
+ kernel/dovetail.c        | 2 +-
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/dovetail.h b/include/linux/dovetail.h
+index 2eed47788..6a244a44a 100644
+--- a/include/linux/dovetail.h
++++ b/include/linux/dovetail.h
+@@ -315,4 +315,8 @@ static __always_inline bool dovetail_debug(void)
+ 	return IS_ENABLED(CONFIG_DEBUG_DOVETAIL);
+ }
+ 
++#ifndef arch_dovetail_is_syscall
++#define arch_dovetail_is_syscall(__nr)	((__nr) == __NR_prctl)
++#endif
++
+ #endif /* _LINUX_DOVETAIL_H */
+diff --git a/kernel/dovetail.c b/kernel/dovetail.c
+index 4df6b23cd..4d1e4c35b 100644
+--- a/kernel/dovetail.c
++++ b/kernel/dovetail.c
+@@ -181,7 +181,7 @@ static inline bool maybe_oob_syscall(unsigned int nr, struct pt_regs *regs)
+ 			return true;
+ 	}
+ 
+-	return nr == __NR_prctl && syscall_get_arg0(regs) & __OOB_SYSCALL_BIT;
++	return arch_dovetail_is_syscall(nr) && syscall_get_arg0(regs) & __OOB_SYSCALL_BIT;
+ }
+ 
+ int pipeline_syscall(unsigned int nr, struct pt_regs *regs)
+-- 
+2.38.1
+

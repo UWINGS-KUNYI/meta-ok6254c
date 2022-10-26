@@ -1,0 +1,79 @@
+From dc27fc773206299fa59b02fac64247b09d8d2b2b Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Tue, 7 Mar 2017 17:38:16 +0100
+Subject: [PATCH 025/179] stop_machine: irq_pipeline: atomic stop-context
+ operations
+
+stop_machine() guarantees that all online CPUs are spinning
+non-preemptible in a known code location before a subset of them may
+safely run a stop-context function. This service is typically useful
+for live patching the kernel code, or changing global memory mappings,
+so that no activity could run in parallel until the system has
+returned to a stable state after all stop-context operations have
+completed.
+
+When interrupt pipelining is enabled, we have to provide the same
+guarantee by restoring hard interrupt disabling where virtualizing the
+interrupt disable flag would defeat it.
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ include/linux/stop_machine.h | 3 +++
+ kernel/stop_machine.c        | 4 +++-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/stop_machine.h b/include/linux/stop_machine.h
+index 63ea9aff3..0fb9ce4eb 100644
+--- a/include/linux/stop_machine.h
++++ b/include/linux/stop_machine.h
+@@ -6,6 +6,7 @@
+ #include <linux/cpumask.h>
+ #include <linux/smp.h>
+ #include <linux/list.h>
++#include <linux/interrupt.h>
+ 
+ /*
+  * stop_cpu[s]() is simplistic per-cpu maximum priority cpu
+@@ -129,7 +130,9 @@ static __always_inline int stop_machine_cpuslocked(cpu_stop_fn_t fn, void *data,
+ 	unsigned long flags;
+ 	int ret;
+ 	local_irq_save(flags);
++	hard_irq_disable();
+ 	ret = fn(data);
++	hard_irq_enable();
+ 	local_irq_restore(flags);
+ 	return ret;
+ }
+diff --git a/kernel/stop_machine.c b/kernel/stop_machine.c
+index 890b79cf0..229922cd1 100644
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@ -216,8 +216,8 @@ static int multi_cpu_stop(void *data)
+ 			curstate = newstate;
+ 			switch (curstate) {
+ 			case MULTI_STOP_DISABLE_IRQ:
+-				local_irq_disable();
+ 				hard_irq_disable();
++				local_irq_disable();
+ 				break;
+ 			case MULTI_STOP_RUN:
+ 				if (is_active)
+@@ -238,6 +238,7 @@ static int multi_cpu_stop(void *data)
+ 		rcu_momentary_dyntick_idle();
+ 	} while (curstate != MULTI_STOP_EXIT);
+ 
++	hard_irq_enable();
+ 	local_irq_restore(flags);
+ 	return err;
+ }
+@@ -589,6 +590,7 @@ int stop_machine_cpuslocked(cpu_stop_fn_t fn, void *data,
+ 		local_irq_save(flags);
+ 		hard_irq_disable();
+ 		ret = (*fn)(data);
++		hard_irq_enable();
+ 		local_irq_restore(flags);
+ 
+ 		return ret;
+-- 
+2.38.1
+

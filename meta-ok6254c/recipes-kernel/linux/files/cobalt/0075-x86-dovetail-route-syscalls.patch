@@ -1,0 +1,160 @@
+From b7b85eb69aa87221d52fc52b8c4dc267d83f9885 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Mon, 6 May 2019 18:37:41 +0200
+Subject: [PATCH 075/179] x86: dovetail: route syscalls
+
+Signed-off-by: Philippe Gerum <rpm@xenomai.org>
+---
+ arch/x86/entry/common.c            | 10 ++++++++
+ arch/x86/include/asm/thread_info.h |  2 ++
+ include/linux/entry-common.h       |  7 ++++++
+ kernel/entry/common.c              | 40 ++++++++++++++++++++++++++++--
+ 4 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/entry/common.c b/arch/x86/entry/common.c
+index 93a3122cd..dd901cfd1 100644
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -40,6 +40,15 @@ __visible noinstr void do_syscall_64(unsigned long nr, struct pt_regs *regs)
+ {
+ 	nr = syscall_enter_from_user_mode(regs, nr);
+ 
++	if (dovetailing()) {
++		if (nr == EXIT_SYSCALL_OOB) {
++			hard_local_irq_disable();
++			return;
++		}
++		if (nr == EXIT_SYSCALL_TAIL)
++			goto done;
++	}
++
+ 	instrumentation_begin();
+ 	if (likely(nr < NR_syscalls)) {
+ 		nr = array_index_nospec(nr, NR_syscalls);
+@@ -53,6 +62,7 @@ __visible noinstr void do_syscall_64(unsigned long nr, struct pt_regs *regs)
+ #endif
+ 	}
+ 	instrumentation_end();
++done:
+ 	syscall_exit_to_user_mode(regs);
+ }
+ #endif
+diff --git a/arch/x86/include/asm/thread_info.h b/arch/x86/include/asm/thread_info.h
+index f0a50d2a8..926eff3d2 100644
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -100,6 +100,7 @@ struct thread_info {
+ #define TIF_MEMDIE		20	/* is terminating due to OOM killer */
+ #define TIF_POLLING_NRFLAG	21	/* idle is polling for TIF_NEED_RESCHED */
+ #define TIF_IO_BITMAP		22	/* uses I/O bitmap */
++#define TIF_RETUSER		23	/* INBAND_TASK_RETUSER is pending */
+ #define TIF_FORCED_TF		24	/* true if TF in eflags artificially */
+ #define TIF_BLOCKSTEP		25	/* set when we want DEBUGCTLMSR_BTF */
+ #define TIF_MAYDAY		26	/* emergency trap pending */
+@@ -129,6 +130,7 @@ struct thread_info {
+ #define _TIF_SLD		(1 << TIF_SLD)
+ #define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+ #define _TIF_IO_BITMAP		(1 << TIF_IO_BITMAP)
++#define _TIF_RETUSER		(1 << TIF_RETUSER)
+ #define _TIF_FORCED_TF		(1 << TIF_FORCED_TF)
+ #define _TIF_MAYDAY		(1 << TIF_MAYDAY)
+ #define _TIF_BLOCKSTEP		(1 << TIF_BLOCKSTEP)
+diff --git a/include/linux/entry-common.h b/include/linux/entry-common.h
+index accc8b570..5abb6e42e 100644
+--- a/include/linux/entry-common.h
++++ b/include/linux/entry-common.h
+@@ -72,6 +72,13 @@
+ 	 _TIF_NEED_RESCHED | _TIF_PATCH_PENDING |			\
+ 	 ARCH_EXIT_TO_USER_MODE_WORK)
+ 
++/*
++ * Status codes of syscall entry when Dovetail is enabled. Must not
++ * conflict with valid syscall numbers.
++ */
++#define EXIT_SYSCALL_OOB	(-1)
++#define EXIT_SYSCALL_TAIL	(-2)
++
+ /**
+  * arch_check_user_regs - Architecture specific sanity check for user mode regs
+  * @regs:	Pointer to currents pt_regs
+diff --git a/kernel/entry/common.c b/kernel/entry/common.c
+index 60ac55ebe..5e3324845 100644
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -100,6 +100,17 @@ static __always_inline long
+ __syscall_enter_from_user_work(struct pt_regs *regs, long syscall)
+ {
+ 	unsigned long ti_work;
++	int ret;
++
++	/*
++	 * Pipeline the syscall to the companion core if the current
++	 * task wants this. Compiled out if not dovetailing.
++	 */
++	ret = pipeline_syscall(syscall, regs);
++	if (ret > 0)	/* out-of-band, bail out. */
++		return EXIT_SYSCALL_OOB;
++	if (ret < 0)		/* in-band, tail work only. */
++		return EXIT_SYSCALL_TAIL;
+ 
+ 	ti_work = READ_ONCE(current_thread_info()->flags);
+ 	if (ti_work & SYSCALL_ENTER_WORK)
+@@ -216,19 +227,37 @@ static unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
+ 	return ti_work;
+ }
+ 
++static inline bool do_retuser(unsigned long ti_work)
++{
++	if (dovetailing() && (ti_work & _TIF_RETUSER)) {
++		hard_local_irq_enable();
++		inband_retuser_notify();
++		hard_local_irq_disable();
++		/* RETUSER might have switched oob */
++		return running_inband();
++	}
++
++	return false;
++}
++
+ static void exit_to_user_mode_prepare(struct pt_regs *regs)
+ {
+-	unsigned long ti_work = READ_ONCE(current_thread_info()->flags);
++	unsigned long ti_work;
+ 
+ 	check_hard_irqs_disabled();
+ 
+ 	lockdep_assert_irqs_disabled();
++again:
++	ti_work = READ_ONCE(current_thread_info()->flags);
+ 
+ 	if (unlikely(ti_work & EXIT_TO_USER_MODE_WORK))
+ 		ti_work = exit_to_user_mode_loop(regs, ti_work);
+ 
+ 	arch_exit_to_user_mode_prepare(regs, ti_work);
+ 
++	if (do_retuser(ti_work))
++		goto again;
++
+ 	/* Ensure that the address limit is intact and no locks are held */
+ 	addr_limit_user_check();
+ 	lockdep_assert_irqs_disabled();
+@@ -290,8 +319,15 @@ static void syscall_exit_to_user_mode_prepare(struct pt_regs *regs)
+ 	 * Do one-time syscall specific work. If these work items are
+ 	 * enabled, we want to run them exactly once per syscall exit with
+ 	 * interrupts enabled.
++	 *
++	 * Dovetail: if this does not look like an in-band syscall, it
++	 * has to belong to the companion core. Typically,
++	 * __OOB_SYSCALL_BIT would be set in this value. Skip the
++	 * work for those syscalls.
+ 	 */
+-	if (unlikely(cached_flags & SYSCALL_EXIT_WORK))
++	if (unlikely((cached_flags & SYSCALL_EXIT_WORK) &&
++		(!irqs_pipelined() ||
++			syscall_get_nr(current, regs) < NR_syscalls)))
+ 		syscall_exit_work(regs, cached_flags);
+ }
+ 
+-- 
+2.38.1
+
