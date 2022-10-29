@@ -61,6 +61,8 @@ local_conf_header:
     USERS += "root"
   debug_feature: |
     EXTRA_IMAGE_FEATURES = " debug-tweaks "
+  image_install: |
+    CORE_IMAGE_EXTRA_INSTALL:append = "kernel-modules "
 
 machine: ok6254c
 
