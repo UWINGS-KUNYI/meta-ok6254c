@@ -5,3 +5,4 @@ meta-openembedded
 meta-ti
 poky
 re-fmtboot.sh
+sdk

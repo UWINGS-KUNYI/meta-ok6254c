@@ -71,7 +71,12 @@ local_conf_header:
     CORE_IMAGE_EXTRA_INSTALL += "kernel-module-nxp89xx linux-firmware-nxp89xx nxp-wlan-sdk "
     CORE_IMAGE_EXTRA_INSTALL += "hostapd iw wpa-supplicant wireless-regdb-static "
   xenomai_install: |
-    IMAGE_INSTALL:append = "xenomai xenomai-bin libgcc "
+    IMAGE_FEATURES += "dev-pkgs"
+    IMAGE_INSTALL:append = " \
+      xenomai xenomai-bin xenomai-dev libgcc \
+      kernel-dev  kernel-devsrc \
+      git wget gcc g++ make binutils gawk flex bison autoconf automake \
+    "
 
 machine: ok6254c
 
