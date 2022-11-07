@@ -4,3 +4,4 @@ meta-arm
 meta-openembedded
 meta-ti
 poky
+re-fmtboot.sh

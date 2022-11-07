@@ -38,7 +38,12 @@ SRC_URI += "${KERNEL_GIT_URI};protocol=${KERNEL_GIT_PROTOCOL};branch=${BRANCH} \
 	    file://defconfig \
 	    ${XENOMAI_DOVETAIL} \
 	    ${XENOMAI_KERNEL_PATCH} \
+	    file://xeno_opt.cfg \
 	   "
+
+KERNEL_CONFIG_FRAGMENTS = " \
+	${WORKDIR}/xeno_opt.cfg \
+	"
 
 FILES:${KERNEL_PACKAGE_NAME}-devicetree += "/${KERNEL_IMAGEDEST}/*.itb"
 
