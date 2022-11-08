@@ -67,6 +67,7 @@ local_conf_header:
     EXTRA_IMAGE_FEATURES = " debug-tweaks "
   image_install: |
     CORE_IMAGE_EXTRA_INSTALL += "kernel-modules "
+    CORE_IMAGE_EXTRA_INSTALL += "ethtool "
   wifi_module: |
     CORE_IMAGE_EXTRA_INSTALL += "kernel-module-nxp89xx linux-firmware-nxp89xx nxp-wlan-sdk "
     CORE_IMAGE_EXTRA_INSTALL += "hostapd iw wpa-supplicant wireless-regdb-static "
