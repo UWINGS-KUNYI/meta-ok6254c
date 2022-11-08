@@ -1,8 +1,9 @@
 Yocto Poky for [Forlinx OK6254-C Dev Board](https://www.forlinx.net/product/132.html)
+===
 
 the repository use [kas](https://github.com/siemens/kas) to create development environment and build image
 
-currently testing on kirkstone(4.0.4) release
+currently testing on kirkstone(4.0.5) release
 
 use **'kas-contrainer'** instruction to launch Docker image for build
 
@@ -111,10 +112,17 @@ Initialising tasks: 100% |######################################################
 Currently  1 running tasks (3770 of 3793)  99% |######################################################################################################################################################### |
 0: linux-ti-staging-5.10.140+gitAUTOINC+c3b343850c-r0b do_package - 8s (pid 95299)
 
-
 ```
+verify the below hardware interface
+===
+* RTC
+* Ethernet 1/2
+* WIFI
+* SD
+* USB Host
 
-Know Issues:
+Know Issues
+===
   when use **dd**/**bmaptool** to flash Image onto SD card will failed boot partitions.
   need re-format the partition and manual copy tiboot3.bin, tispl.bin and u-boot.img into the partitions.
 
