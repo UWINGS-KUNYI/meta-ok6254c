@@ -120,11 +120,3 @@ verify the below hardware interface
 * WIFI
 * SD
 * USB Host
-
-Know Issues
-===
-  when use **dd**/**bmaptool** to flash Image onto SD card will failed boot partitions.
-  need re-format the partition and manual copy tiboot3.bin, tispl.bin and u-boot.img into the partitions.
-
-  like the below picture
-  ![manual format boot](./docs/imgs/manual%20reformat%20boot.png)
