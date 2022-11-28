@@ -11,14 +11,14 @@ defaults:
       repo: meta-ok6254c
 
 repos:
-  meta-ti:
+  sources/meta-ti:
     url: git://git.yoctoproject.org/meta-ti
     refspec: kirkstone
     layers:
       meta-ti-bsp:
       meta-ti-extras:
 
-  meta-arm:
+  sources/meta-arm:
     url: git://git.yoctoproject.org/meta-arm
     refspec: kirkstone
     layers:
@@ -26,7 +26,7 @@ repos:
       meta-arm-bsp:
       meta-arm-toolchain:
 
-  poky:
+  sources/poky:
     url: git://git.yoctoproject.org/poky
     refspec: kirkstone
     layers:
@@ -34,7 +34,7 @@ repos:
       meta-poky:
       meta-yocto-bsp:
 
-  meta-openembedded:
+  sources/meta-openembedded:
     url: https://git.openembedded.org/meta-openembedded
     refspec: kirkstone
     layers:
