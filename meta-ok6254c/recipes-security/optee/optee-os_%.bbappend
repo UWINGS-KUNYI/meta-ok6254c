@@ -1,0 +1,3 @@
+
+
+EXTRA_OEMAKE:append:am62xx = " CFG_WARN_INSECURE=n"
